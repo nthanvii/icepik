@@ -184,6 +184,9 @@ button {
 }
 
 .report-list {
+  /* Contain absolutely positioned children (the status dots' sr-only labels)
+     so cards scrolled out of view can't make the page scroll. */
+  position: relative;
   flex: 1;
   min-height: 0;
   overflow-y: auto;
