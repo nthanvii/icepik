@@ -361,8 +361,8 @@ button {
 }
 
 .pin-icon:focus-visible .pin {
-  outline: 3px solid var(--blue);
-  outline-offset: 2px;
+  outline: 0.1875rem solid var(--blue);
+  outline-offset: 0.125rem;
 }
 
 .pin-active .pin {
