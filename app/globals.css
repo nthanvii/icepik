@@ -473,7 +473,7 @@ button {
 .map-shell {
   position: relative;
   min-width: 0;
-  background: #f2efe9;
+  background: #ececea;
 }
 
 .map {
@@ -483,7 +483,13 @@ button {
 
 .leaflet-container {
   font-family: var(--font-sans);
-  background: #f2efe9;
+  background: #ececea;
+}
+
+/* OpenStreetMap's standard style is full of color. Mute it so the map reads
+   as a quiet backdrop and the pins stand out. */
+.map-tiles {
+  filter: saturate(0.3) brightness(1.06) contrast(0.85);
 }
 
 .leaflet-bar {

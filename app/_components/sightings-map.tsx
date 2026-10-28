@@ -104,6 +104,8 @@ export function SightingsMap({
       // tile usage policy). Tiles load only after the policy is accepted.
       L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
         maxZoom: 19,
+        // Muted in globals.css so the pins stand out.
+        className: "map-tiles",
         attribution:
           '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
       }).addTo(instance);
