@@ -13,6 +13,7 @@ import {
 } from "./map-pins";
 
 export type Point = { lat: number; lng: number };
+export type Bounds = { south: number; west: number; north: number; east: number };
 export type Padding = {
   paddingTopLeft: [number, number];
   paddingBottomRight: [number, number];
@@ -22,6 +23,8 @@ export type MapApi = {
   showPoint(point: Point, padding: Padding): void;
   showPoints(points: Point[], padding: Padding): void;
   center(): Point | null;
+  zoomIn(): void;
+  zoomOut(): void;
 };
 
 type Props = {
@@ -34,6 +37,7 @@ type Props = {
   draft: Point | null;
   onPlace: (point: Point) => void;
   searchResult: (Point & { label: string }) | null;
+  onViewChange: (bounds: Bounds) => void;
 };
 
 export function SightingsMap({
@@ -46,6 +50,7 @@ export function SightingsMap({
   draft,
   onPlace,
   searchResult,
+  onViewChange,
 }: Props) {
   const node = useRef<HTMLDivElement>(null);
   const leaflet = useRef<typeof Leaflet | null>(null);
@@ -57,9 +62,9 @@ export function SightingsMap({
   const [zoom, setZoom] = useState(13);
 
   // Leaflet handlers are attached once; they call the latest props.
-  const latest = useRef({ onSelect, onSelectGroup, onPlace, placing });
+  const latest = useRef({ onSelect, onSelectGroup, onPlace, placing, onViewChange });
   useEffect(() => {
-    latest.current = { onSelect, onSelectGroup, onPlace, placing };
+    latest.current = { onSelect, onSelectGroup, onPlace, placing, onViewChange };
   });
 
   useImperativeHandle(
@@ -80,6 +85,12 @@ export function SightingsMap({
         const center = map.current?.getCenter();
         return center ? { lat: center.lat, lng: center.lng } : null;
       },
+      zoomIn() {
+        map.current?.zoomIn();
+      },
+      zoomOut() {
+        map.current?.zoomOut();
+      },
     }),
     [],
   );
@@ -98,8 +109,6 @@ export function SightingsMap({
         zoomControl: false,
       });
 
-      L.control.zoom({ position: "bottomright" }).addTo(instance);
-
       // Exactly this URL, with the attribution visible (OpenStreetMap's
       // tile usage policy). Tiles load only after the policy is accepted.
       L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
@@ -108,7 +117,19 @@ export function SightingsMap({
           '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
       }).addTo(instance);
 
+      const reportView = () => {
+        const bounds = instance.getBounds();
+        latest.current.onViewChange({
+          south: bounds.getSouth(),
+          west: bounds.getWest(),
+          north: bounds.getNorth(),
+          east: bounds.getEast(),
+        });
+      };
+
       instance.on("zoomend", () => setZoom(instance.getZoom()));
+      // Also fires after zooms and resizes.
+      instance.on("moveend", reportView);
       instance.on("click", (event) => {
         if (latest.current.placing) {
           latest.current.onPlace({ lat: event.latlng.lat, lng: event.latlng.lng });
@@ -118,6 +139,7 @@ export function SightingsMap({
       leaflet.current = L;
       map.current = instance;
       pins.current = L.layerGroup().addTo(instance);
+      reportView();
       setReady(true);
     });
 
