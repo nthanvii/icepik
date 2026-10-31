@@ -7,10 +7,15 @@
   --text: #ffffff;
   --muted: #8d9099;
   --red: #ff1d25;
+  /* Behind small white text, where --red is too light (4.8:1 instead of 3.9:1). */
+  --red-strong: #e3101b;
   --yellow: #ffc800;
-  --green: #10c25b;
-  --vote-red: #f43b3b;
+  /* Behind dark text (6.2:1). It stays lighter than --red-strong, so the two
+     vote buttons differ for colour-blind people too. */
+  --green: #33b56b;
   --blue: #4f93c8;
+  /* Behind white text on buttons, where --blue is too light (5.4:1 instead of 3.3:1). */
+  --blue-strong: #2f6f9f;
   --rail-width: 6.5rem;
   --panel-width: min(26rem, calc(100vw - var(--rail-width) - 26rem));
   --font-sans: var(--font-outfit), "Glacial Indifference", Arial, sans-serif;
@@ -412,13 +417,13 @@ button {
   justify-self: start;
   padding: 0.75rem 1.5rem;
   border-radius: 62.4375rem;
-  background: var(--blue);
+  background: var(--blue-strong);
   font-size: 0.9375rem;
   font-weight: 600;
 }
 
 .rights-card-button:hover {
-  background: #5ea2d6;
+  background: #255a82;
 }
 
 .area-card header {
@@ -473,7 +478,7 @@ button {
 .map-shell {
   position: relative;
   min-width: 0;
-  background: #f2efe9;
+  background: #fafaf8;
 }
 
 .map {
@@ -483,7 +488,7 @@ button {
 
 .leaflet-container {
   font-family: var(--font-sans);
-  background: #f2efe9;
+  background: #fafaf8;
 }
 
 .leaflet-bar {
@@ -753,11 +758,11 @@ button {
 }
 
 .primary-button {
-  background: var(--blue);
+  background: var(--blue-strong);
 }
 
 .primary-button:hover {
-  background: #3f80b3;
+  background: #255a82;
 }
 
 .secondary-button {
@@ -769,11 +774,11 @@ button {
 }
 
 .danger-button {
-  background: var(--vote-red);
+  background: var(--red-strong);
 }
 
 .danger-button:hover {
-  background: #d92f2f;
+  background: #b82626;
 }
 
 .primary-button:disabled,
@@ -1019,7 +1024,7 @@ button {
 }
 
 .badge-verified {
-  background: var(--red);
+  background: var(--red-strong);
   color: #fff;
 }
 
@@ -1085,10 +1090,11 @@ button {
 
 .vote-up {
   background: var(--green);
+  color: #1d1f26;
 }
 
 .vote-down {
-  background: var(--vote-red);
+  background: var(--red-strong);
 }
 
 .vote[aria-pressed="true"] {
@@ -1140,13 +1146,21 @@ button {
 }
 
 .cluster-verified {
-  background: var(--red);
+  background: var(--red-strong);
   color: #fff;
+}
+
+/* The same dark amber rim as unverified pins: yellow is nearly as light as
+   the map. */
+.cluster-unverified {
+  box-shadow:
+    0 0 0 0.125rem #8a6a00,
+    0 0.1875rem 0.5rem rgb(0 0 0 / 0.3);
 }
 
 .cluster-disputed {
   border-style: dashed;
-  background: #8d9099;
+  background: #646872;
   color: #fff;
 }
 
@@ -1400,6 +1414,10 @@ button {
 @media (max-width: 899px) {
   html {
     font-size: 16px;
+    /* The map credits get their own row at the bottom, and everything else
+       at the bottom sits above it. One line fits from 320px wide; on
+       narrower phones the second line still ends below the REPORT button. */
+    --map-credits: 1.125rem;
   }
 
   /* Phones: the rail becomes a top bar and the panel covers the map. */
@@ -1449,7 +1467,7 @@ button {
   .panel {
     top: 0.75rem;
     right: 0.75rem;
-    bottom: 0.75rem;
+    bottom: calc(0.75rem + var(--map-credits));
     left: 0.75rem;
     width: auto;
   }
@@ -1478,13 +1496,13 @@ button {
     right: 0.75rem;
     left: auto;
     width: min(26rem, calc(100% - 1.5rem));
-    max-height: min(21.25rem, calc(100% - 11rem));
+    max-height: min(21.25rem, calc(100% - 11rem - var(--map-credits)));
     border-radius: 1.75rem;
   }
 
   .report-button {
     right: 1rem;
-    bottom: 1rem;
+    bottom: calc(1rem + var(--map-credits));
     min-width: 0;
     height: 4rem;
     padding: 0 1.625rem;
@@ -1493,19 +1511,34 @@ button {
   }
 
   .leaflet-bottom.leaflet-right .leaflet-control-zoom {
-    margin: 0 1rem 6rem 0;
+    margin: 0 1rem calc(7rem + var(--map-credits)) 0;
+  }
+
+  .leaflet-bottom.leaflet-right {
+    left: 0;
+  }
+
+  .leaflet-bottom.leaflet-right .leaflet-control-attribution {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    max-width: 100%;
   }
 
   .notice {
-    bottom: 6rem;
+    bottom: calc(6rem + var(--map-credits));
   }
 
   .pick-banner {
-    bottom: 1rem;
+    bottom: calc(1rem + var(--map-credits));
   }
 
   .pick-banner ~ .notice {
-    bottom: 11rem;
+    bottom: calc(11rem + var(--map-credits));
+  }
+
+  .starter {
+    bottom: calc(1.5rem + var(--map-credits));
   }
 
   .choices {
