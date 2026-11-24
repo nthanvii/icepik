@@ -21,6 +21,10 @@ export const metadata: Metadata = {
     title: "ICEPik",
     statusBarStyle: "black-translucent",
   },
+  // Next emits only the unprefixed mobile-web-app-capable for capable: true.
+  // Safari's documented tag is the apple- one (and startup images need it),
+  // so send both.
+  other: { "apple-mobile-web-app-capable": "yes" },
 };
 
 // "cover" lets the page reach under a phone's notch and home indicator, and

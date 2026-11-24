@@ -30,7 +30,7 @@ The app doesn't use these files yet: `public/brand/`, `app/icon.svg`, `app/favic
 
 `app/_components/brand-logo.tsx` shows the dark-text logo only in high contrast mode with a light theme. Everywhere else the logo sits on a dark background.
 
-`app/favicon.ico` (16, 32 and 48 px) and `app/apple-icon.png` (180 px, on #1d1f26) were rendered from `app/icon.svg`.
+`app/favicon.ico` (16, 32 and 48 px) was rendered from `app/icon.svg`. `app/apple-icon.png` (180 px, on #1a1e22) and the install icons in `public/icons/` are drawn by `scripts/render-icons.mjs` from the white backing version.
 
 ## Notes
 
