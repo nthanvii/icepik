@@ -26,6 +26,7 @@ The app doesn't use these files yet: `public/brand/`, `app/icon.svg`, `app/favic
 | `public/brand/icepik-logo-tall.svg` | `icepik_07_inline_text-bottom/icepik_07_inline_text-bottom-faithful.svg` |
 | `public/brand/icepik-logo-tall-dark-text.svg` | `icepik_07_inline_text-bottom/icepik_07_inline_text-bottom-faithful-dark-text.svg` |
 | `app/icon.svg` | `icepik_icon/icepik_icon-faithful.svg` |
+| `public/icons/*.png` (install icons) and `app/apple-icon.png` | `icepik_icon/icepik_icon-faithful-white-backing.svg`, drawn on #1a1e22 by `scripts/render-icons.mjs` |
 
 `app/_components/brand-logo.tsx` shows the dark-text logo only in high contrast mode with a light theme. Everywhere else the logo sits on a dark background.
 

@@ -13,6 +13,14 @@ const outfit = Outfit({
 export const metadata: Metadata = {
   title: "ICEPik",
   description: "Report and verify ICE sightings in real time.",
+  // Opens full-screen from an iPhone's home screen. "black-translucent" lets
+  // the page reach under the status bar; globals.css already pads the safe
+  // areas.
+  appleWebApp: {
+    capable: true,
+    title: "ICEPik",
+    statusBarStyle: "black-translucent",
+  },
 };
 
 // "cover" lets the page reach under a phone's notch and home indicator, and
@@ -22,6 +30,9 @@ export const viewport: Viewport = {
   width: "device-width",
   initialScale: 1,
   viewportFit: "cover",
+  // The app's --surface colour: tints the browser bar and the installed app's
+  // title bar.
+  themeColor: "#1a1e22",
 };
 
 export default async function RootLayout({
