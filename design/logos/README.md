@@ -15,8 +15,6 @@ Each logo has these versions:
 
 `node scripts/white-backing.mjs` makes every `-white-backing.svg` from the file next to it, and `node scripts/white-backing.mjs --check` fails if any is missing or out of date. Run it again after changing a logo with the cube. The backing is a copy of the first path in the cube's luminance mask (`ice-alpha`, or `alpha` in `ice_cube_clean`), which is the cube's outline: a plain white path, no filter, so design tools show it too. It is drawn just before the camera and the cube, so it sits exactly under them. Checked by render: every solid pixel of the cube and camera is on the backing; only anti-aliased edge pixels fall outside it.
 
-The app doesn't use these files yet: `public/brand/`, `app/icon.svg`, `app/favicon.ico` and `app/apple-icon.png` are unchanged.
-
 ## Used by the app
 
 | File in the app | Copied from |
