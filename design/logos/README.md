@@ -15,8 +15,6 @@ Each logo has these versions:
 
 `node scripts/white-backing.mjs` makes every `-white-backing.svg` from the file next to it, and `node scripts/white-backing.mjs --check` fails if any is missing or out of date. Run it again after changing a logo with the cube. The backing is a copy of the first path in the cube's luminance mask (`ice-alpha`, or `alpha` in `ice_cube_clean`), which is the cube's outline: a plain white path, no filter, so design tools show it too. It is drawn just before the camera and the cube, so it sits exactly under them. Checked by render: every solid pixel of the cube and camera is on the backing; only anti-aliased edge pixels fall outside it.
 
-The app doesn't use these files yet: `public/brand/`, `app/icon.svg`, `app/favicon.ico` and `app/apple-icon.png` are unchanged.
-
 ## Used by the app
 
 | File in the app | Copied from |
@@ -26,10 +24,11 @@ The app doesn't use these files yet: `public/brand/`, `app/icon.svg`, `app/favic
 | `public/brand/icepik-logo-tall.svg` | `icepik_07_inline_text-bottom/icepik_07_inline_text-bottom-faithful.svg` |
 | `public/brand/icepik-logo-tall-dark-text.svg` | `icepik_07_inline_text-bottom/icepik_07_inline_text-bottom-faithful-dark-text.svg` |
 | `app/icon.svg` | `icepik_icon/icepik_icon-faithful.svg` |
+| `public/icons/*.png` (install icons) and `app/apple-icon.png` | `icepik_icon/icepik_icon-faithful-white-backing.svg`, drawn on #1a1e22 by `scripts/render-icons.mjs` |
 
 `app/_components/brand-logo.tsx` shows the dark-text logo only in high contrast mode with a light theme. Everywhere else the logo sits on a dark background.
 
-`app/favicon.ico` (16, 32 and 48 px) and `app/apple-icon.png` (180 px, on #1d1f26) were rendered from `app/icon.svg`.
+`app/favicon.ico` (16, 32 and 48 px) was rendered from `app/icon.svg`. `app/apple-icon.png` (180 px, on #1a1e22) and the install icons in `public/icons/` are drawn by `scripts/render-icons.mjs` from the white backing version.
 
 ## Notes
 
