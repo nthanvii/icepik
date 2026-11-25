@@ -33,7 +33,7 @@ Home and work places stay in the browser and never reach the database. The map p
 
 Where the browser has WebGL 2, the map is drawn from CARTO's vector map instead of its pictures, by MapLibre GL, which is bundled from npm like Leaflet. So the Content-Security-Policy's `connect-src` also allows `https://basemaps.cartocdn.com` and `https://tiles.basemaps.cartocdn.com`, for the map's style, tiles, fonts and icons (none of them carry the CARTO key). Without WebGL 2, or if CARTO's vector map can't be loaded, the map shows CARTO's pictures as before.
 
-The site needs these environment variables, in Vercel and (all except the two secret keys) in `.env.local` for `npm run dev`:
+The site needs these environment variables, in Vercel and (all except the secret keys) in `.env.local` for `npm run dev`:
 
 | Variable | What it is |
 | --- | --- |
@@ -41,8 +41,10 @@ The site needs these environment variables, in Vercel and (all except the two se
 | `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | The project's publishable key. The older `NEXT_PUBLIC_SUPABASE_ANON_KEY` works too. Never put the secret or `service_role` key here. |
 | `NEXT_PUBLIC_CARTO_KEY` | CARTO's free basemap key, from https://carto.com/basemaps/apikey. Without it, every map picture reads "API KEY REQUIRED". |
 | `NEXT_PUBLIC_TURNSTILE_SITE_KEY` | Optional. ICEPik's Cloudflare Turnstile site key (`0x4AAAAAAGD9-RGFXV2Fys3x`) is built into `app/_components/captcha.tsx`, so leave this unset. Set it only to use a different widget. An empty value turns the check off, for local checks against `scripts/mock-supabase.mjs`; CAPTCHA is required in Supabase, so a production build stops with an error if it's set to an empty value. |
-| `SUPABASE_SECRET_KEY` | Supabase's secret key (`sb_secret_…`), used only by the password reset in `app/actions/recovery.ts`. It skips every database rule. Add it in Vercel to the **Production** environment only, with **Sensitive** turned on, never to Preview or Development, and never with a `NEXT_PUBLIC_` name. Never put the production key in `.env.local`: to try the reset locally, use a scratch project's URL and keys. Without the key, the reset says it isn't available. |
+| `SUPABASE_SECRET_KEY` | Supabase's secret key (`sb_secret_…`), used only by the password reset in `app/actions/recovery.ts` and push alerts in `app/actions/push.ts`. It skips every database rule. Add it in Vercel to the **Production** environment only, with **Sensitive** turned on, never to Preview or Development, and never with a `NEXT_PUBLIC_` name. Never put the production key in `.env.local`: to try the reset locally, use a scratch project's URL and keys. Without the key, the reset says it isn't available. |
 | `DEMO_SUPABASE_SECRET_KEY` | Optional. The **demo** project's secret key, used only by the demo's own password reset on `/demo` (`app/actions/recovery.ts`, through `createDemoAdminClient()` in `lib/supabase/admin.ts`), where any letters and numbers work as the recovery key. It skips every rule in the demo project, so treat it like `SUPABASE_SECRET_KEY`: Vercel's **Production** environment only, **Sensitive** on, never a `NEXT_PUBLIC_` name. It's only ever sent to the demo project's URL, and the demo's reset refuses to run if that URL is the real project's. Without it, the reset on `/demo` says it isn't set up. |
+| `NEXT_PUBLIC_VAPID_PUBLIC_KEY` | The public VAPID key for push alerts (see "Owner steps for push" in `docs/database-handoff.md`). Not secret. Without it, turning on alerts says they aren't available. |
+| `TURNSTILE_SECRET_KEY` | The secret key of the same Turnstile widget that Supabase Auth's CAPTCHA uses, for the check before alerts are turned on (`lib/turnstile.ts`). Add it in Vercel's **Production** environment as type **Secret**, never with a `NEXT_PUBLIC_` name. Without it, every Vercel deployment refuses to turn on alerts; a local run (no `VERCEL_ENV`) skips the check, for the checks against `scripts/mock-supabase.mjs`. |
 | `NEXT_PUBLIC_DEMO_SUPABASE_URL` | Optional. The URL of the separate Supabase project for the demo at `/demo`. |
 | `NEXT_PUBLIC_DEMO_SUPABASE_PUBLISHABLE_KEY` | Optional. That demo project's publishable key (or `NEXT_PUBLIC_DEMO_SUPABASE_ANON_KEY`). Without the demo variables, `/demo` shows the map as "not connected". |
 
@@ -109,7 +111,7 @@ Still to add:
 - **Photos and videos:** a place to store them (Supabase Storage). Before storing a photo, we'll remove the hidden data inside it that can show where it was taken and on what phone.
 - **Languages:** a language choice, translated text and a short tutorial on the first visit.
 - **A legend** that explains the pin colors.
-- **Nearby alerts:** notifications limited to a small area around you. One complaint about the Citizen app was getting alerts from the other side of the country.
+- **Nearby alerts:** push notifications for new sightings near your saved places (at most 5) or, if you choose, near where you last opened ICEPik, within 0.25 to 5 miles. One complaint about the Citizen app was getting alerts from the other side of the country. The server side is built: the `push_subscriptions` table keeps only each phone's push endpoint and the ~2.2 km squares around its places, with no user id, and forgets it 30 days after the app was last opened; a daily `pg_cron` job (`purge-push-subscriptions`) clears expired rows. The phone checks the exact distance itself. Still to build: the settings screens, the service worker and the Edge Function that sends the alerts. Owner steps (VAPID keys, two Vercel variables, the migration) are in `docs/database-handoff.md` under "Owner steps for push".
 - **Reporting harmful posts:** for now, an admin deletes them in Supabase's Table Editor. A report button needs a new table.
 
 Comments are out of scope for this version, as our PRD says.

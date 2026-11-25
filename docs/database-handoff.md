@@ -33,7 +33,7 @@ Confirm these nine Supabase settings with the backend owner, then set up the cli
 | Sign In / Providers → Email → Password Requirements | No required characters | The app suggests a few random words; requiring capitals, digits or symbols refuses those (the live checks' step 2a fails), and NIST advises against such rules |
 | Sign In / Providers → Email → Require current password when changing password | On | Someone holding an unlocked phone can't change the password without knowing it |
 
-**Secret key.** The password reset needs Supabase's secret key (`sb_secret_…`; the older service\_role keys are being retired at the end of 2026). Add it in Vercel as `SUPABASE_SECRET_KEY` to the **Production** environment only, with **Sensitive** turned on: never to Preview or Development or a developer's .env.local (use a scratch project's keys to try the reset locally), and never with a `NEXT_PUBLIC_` name. Only `lib/supabase/admin.ts` reads it; on a deployment without it, the reset answers that it isn't available. The key skips every database rule, so a leak would expose the private links between people and pins, and every account. If it leaks, make a new secret key in Supabase and delete the old one. The demo project's secret key, `DEMO_SUPABASE_SECRET_KEY`, follows the same rules (Production only, Sensitive, never `NEXT_PUBLIC_`); only the demo's reset uses it.
+**Secret key.** The password reset needs Supabase's secret key (`sb_secret_…`; the older service\_role keys are being retired at the end of 2026). Add it in Vercel as `SUPABASE_SECRET_KEY` to the **Production** environment only, with **Sensitive** turned on: never to Preview or Development or a developer's .env.local (use a scratch project's keys to try the reset locally), and never with a `NEXT_PUBLIC_` name. Only `lib/supabase/admin.ts` reads it, for the password reset and push alerts (`app/actions/push.ts`); on a deployment without it, the reset answers that it isn't available and push alerts that they aren't. The key skips every database rule, so a leak would expose the private links between people and pins, and every account. If it leaks, make a new secret key in Supabase and delete the old one. The demo project's secret key, `DEMO_SUPABASE_SECRET_KEY`, follows the same rules (Production only, Sensitive, never `NEXT_PUBLIC_`); only the demo's reset uses it.
 
 **Existing project.** ICEPik's own Supabase project had no real users, so it was started over instead: its ICEPik tables, functions and accounts were deleted and the whole schema was run fresh. A project that still runs the earlier schema and holds real data upgrades with `database/migrations/20261116_recovery_keys.sql`, never the whole schema or its "Starting over" lines, which delete every pin, vote and profile total. The file's header has the steps; do them in this order. (0) Run `scripts/supabase-live-checks.mjs` on a scratch project, and stop unless every check passes. (1) Make sure the Turnstile widget's hostname list includes the live domain, and deploy the app version that ships with the migration (ICEPik's Turnstile site key is built into `app/_components/captcha.tsx`; a production build stops if `NEXT_PUBLIC_TURNSTILE_SITE_KEY` is set to an empty value, which would turn the check off). Its "Delete my account" asks a saved account for its password, which the migration starts to require, and it works with the old database too. Open the site in a private window, accept the terms, and check that the Turnstile check completes and a new anonymous user appears. (2) Count the saved accounts whose login ID breaks the username rule, and delete or rename them: once the migration has run they can be deleted but no longer renamed. The app can't log them in or reset their password (one already signed in on a device can still delete itself). (3) Run the migration. (4) Turn on the settings above, CAPTCHA last. (5) Repeat the private-window check with CAPTCHA on.
 
@@ -104,6 +104,7 @@ The app reads active pins (signed in or not) and inserts new ones. It deletes it
 | `sighting_reporters` | `sighting_id`, `reporter_id` | Read your own rows to list "my posts". The server writes them and deletes them after the pin expires |
 | `profiles` | `id` (the user's id), `preferred_language`, `sightings_posted`, `votes_cast`, `post_limit_hour`, `post_limit_count`, `created_at` | Read your own profile. Change `preferred_language` only through `set_my_language()` |
 | `recovery_keys` | `user_id`, `key_hash` (SHA-256 of the key) | Nothing: the browser roles have no grants on it and there are no row policies. Only the recovery-key functions read or write it |
+| `push_subscriptions` | `id`, `endpoint`, `p256dh`, `auth`, `cells` (the ~2.2 km squares to alert for), `secret_hash` (SHA-256 of the device secret), `created_on`, `expires_on` (dates, no time of day) | Nothing: no grants for the browser roles and no row policies. Only the push functions, called with the secret key, read or write it. See "Push alerts" below |
 
 ### Server functions
 
@@ -118,6 +119,12 @@ The app reads active pins (signed in or not) and inserts new ones. It deletes it
 | `has_recovery_key()` | Signed in | Whether you have a recovery key; ask a saved account without one to make one |
 | `check_recovery_key(p_username, p_key)` | Server only (secret key) | The account id when the username and key match, otherwise nothing |
 | `replace_recovery_key(p_user_id)` | Server only (secret key) | Gives the account a new key after a reset and returns it once |
+| `push_create(p_endpoint, p_p256dh, p_auth, p_cells, p_secret)` | Server only (secret key) | Called by `createPushSubscription` after its Turnstile check. Saves a subscription and returns its id; `push_endpoint_taken` if the endpoint is already saved |
+| `push_update(p_id, p_secret, p_cells?, p_endpoint?, p_p256dh?, p_auth?)` | Server only (secret key) | Called by `updatePushSubscription` and `POST /api/push/renew`. Renews for 30 days, and replaces the cells or swaps the endpoint and keys (all three together); false when the id or secret doesn't match |
+| `push_delete(p_id, p_secret)` | Server only (secret key) | Called by `deletePushSubscription`. False when the id or secret doesn't match |
+| `push_targets(p_lat, p_lng, p_after, p_limit)` | Server only (secret key) | For the sender (an Edge Function, next handoff): the live subscriptions whose cells hold a sighting's square, at most 500 per page, in id order |
+| `push_drop(p_ids)` | Server only (secret key) | For the sender: deletes subscriptions whose push service says they're gone |
+| `push_cell(p_lat, p_lng)`, `push_purge()` | Nobody through the API | The square id for a point (same as `cellOf()` in `lib/push-cells.ts`), and the daily cleanup |
 
 ## How to call it
 
@@ -716,7 +723,7 @@ Server actions are public endpoints: anyone can call one directly with any input
 - **Check every argument at runtime.** TypeScript types aren't enforced when a request arrives. `sightings.ts` checks types, ranges and lengths before touching the database; any new action must do the same.
 - **Build database rows field by field.** Never pass the caller's object into `.insert()` or `.update()`, or they could set fields such as `expires_at`.
 - **Take the user from the session, never from the input.** Don't add a `userId` argument: the database already knows who is calling. If an action ever needs the user on the server, use `supabase.auth.getClaims()`, never `getSession()`.
-- **Keep the secret key in one place.** Only the password reset may use a secret key, through lib/supabase/admin.ts (`createAdminClient()` for the real project, `createDemoAdminClient()` for the demo's reset); never create a secret-key client anywhere else. It skips every database rule, so a mistake there lets any visitor do anything.
+- **Keep the secret key in one place.** Only the password reset (`app/actions/recovery.ts`) and push alerts (`app/actions/push.ts`, which `app/api/push/renew/route.ts` calls) may use a secret key, through lib/supabase/admin.ts (`createAdminClient()` for the real project, `createDemoAdminClient()` for the demo's reset); never create a secret-key client anywhere else, and never use the cookie client for push. It skips every database rule, so a mistake there lets any visitor do anything.
 - **Return only what the screen needs**, and pass on only ICEPik's own error messages (`P0001`). Everything else becomes "Something went wrong."
 - **Keep Next.js's defaults.** Don't add `serverActions.allowedOrigins` or raise `bodySizeLimit` without checking with the backend owner.
 - **Keep server code out of the browser.** `lib/supabase/server.ts` starts with `import 'server-only'`, so the build fails if a client component imports it.
@@ -749,6 +756,55 @@ Server actions are public endpoints: anyone can call one directly with any input
 - In Settings, add "Make a new recovery key" for when someone thinks theirs was seen. It asks for the password and signs in with it first, because the database makes a key only within 10 minutes of a password sign-in. Ask for the current password when changing the password too.
 - After a saved account logs in, call has\_recovery\_key(). If it returns false (an interrupted save, or an account from before recovery keys), ask once to make one.
 
+## Push alerts
+
+Phones can ask for a push alert when a new sighting appears near a saved place (Home, Work and custom places, at most 5 switched on) or, if the person opts in, near where they last opened ICEPik. One alert distance covers all places: 0.25, 0.5, 1, 2 or 5 miles (1 by default). The server side is built; the phone's side comes in later handoffs.
+
+### What the server stores
+
+`public.push_subscriptions`, one row per phone:
+
+| Column | What it is |
+| --- | --- |
+| `id` | Random UUID. The phone keeps it |
+| `endpoint`, `p256dh`, `auth` | The browser's push subscription. The endpoint must be `https://` on Chrome's (`fcm.googleapis.com` or `jmt17.google.com`), Apple's (`web.push.apple.com`), Mozilla's (`updates.push.services.mozilla.com`) or Microsoft's (`*.notify.windows.com`) push service, at most 1,024 characters, so the sender can never be aimed at another URL |
+| `cells` | 1 to 1,000 square ids, sorted, without repeats |
+| `secret_hash` | SHA-256 of a random 32-byte device secret that only the phone holds |
+| `created_on`, `expires_on` | Dates, never times. A row expires 30 days after the app was last opened |
+
+There is no user id. RLS is on with no policies, the browser roles have no grants, and every push function can be called only with the secret key, so nobody can skip the server's checks with the public key. The server actions use `createAdminClient()`, which sends no user session, so Supabase's logs can't tie a subscription request to an account.
+
+### The squares
+
+A square ("cell") is a fixed grid square 0.020° of latitude by 0.026° of longitude, about 2.2 km × 2.2 km at 40°N. Its id is `row * 20000 + col`, worked out in whole thousandths of a degree so the phone (`cellOf()` in `lib/push-cells.ts`) and Postgres (`public.push_cell()`) always agree, even for a pin exactly on an edge (pins are rounded to 0.001°). For each place, the phone sends every square within the alert distance of **the square that holds the place** (`cellsAround()`). That list depends only on which square the place is in, never on where in the square it sits, so the server can't place anyone more precisely than one square, at any alert distance. Five places and the last-opened spot at 5 miles stay under 1,000 squares anywhere in the US (906 at Utqiaġvik, Alaska). The phone checks the exact distance itself and writes the alert text, so the alert's wording never reaches the server.
+
+What the squares don't protect: the server still knows which ~2.2 km squares a phone watches, and a square around someone's home narrows down where they live. Each push service (Google, Apple, Mozilla or Microsoft) sees when a phone gets an alert, though not what it says, and those times can be matched with the public sightings' `created_at` to guess which squares a phone watches. Push service and Supabase logs can be demanded like any other records.
+
+### Functions and the cleanup job
+
+See the table under "Server functions" above. In short: `push_create`, `push_update` and `push_delete` for the server actions; `push_targets` and `push_drop` for the sender; `push_cell` and `push_purge` for the database itself. Errors: `push_endpoint_taken` (that endpoint is already saved), `push_invalid` (bad secret or cells, or an endpoint without its keys), and the table's checks.
+
+`pg_cron` runs `purge-push-subscriptions` every day at 04:17 UTC: `select public.push_purge()` deletes rows whose `expires_on` has passed.
+
+### In the app
+
+- `lib/push-cells.ts`: the grid maths, with no imports, shared by the pages and the service worker. Must match `push_cell()`.
+- `lib/turnstile.ts`: checks a Turnstile token with Cloudflare's siteverify, using `TURNSTILE_SECRET_KEY`, the action `alerts`, and a 5-second limit. It never sends the visitor's IP address. Without the secret, every Vercel deployment (previews too, as they use the real database) refuses with `not_configured`; only a local run with no `VERCEL_ENV` skips the check, for the checks against `scripts/mock-supabase.mjs`.
+- `app/actions/push.ts`: `createPushSubscription` (needs a Turnstile token), `updatePushSubscription` and `deletePushSubscription` (need the device secret). Each returns `{ ok: true, data }` or `{ ok: false, error, message }`, where `error` is `invalid`, `captcha`, `endpoint_taken`, `not_found`, `not_configured` or `failed`.
+- `app/api/push/renew/route.ts`: `POST` only, JSON body `{ id, secret, endpoint, p256dh, auth }`, for the service worker to swap in a new endpoint. Empty answers with `Cache-Control: no-store`: 204 done, 400 bad input (or the endpoint is taken), 403 cross-site (`Sec-Fetch-Site` other than `same-origin`) or wrong id or secret, 503 not set up or the database failed.
+
+### Owner steps for push
+
+Do these on your own computer and in the dashboards. The real project only: `/demo` has no push alerts, so never run the push migration on the demo project.
+
+1. **VAPID keys.** On your own computer, run `npx @pushforge/builder vapid`. It prints a public key (for the app) and a private key in JWK format (for the sender). Keep the private key out of Vercel, the repository and chats; the Edge Function steps (next handoff) say where it goes.
+2. **Vercel.** In the project, open Settings → Environment Variables, and add for the **Production** environment:
+   - `NEXT_PUBLIC_VAPID_PUBLIC_KEY`: the public key from step 1, type **Config** (it's built into the page, so it isn't secret).
+   - `TURNSTILE_SECRET_KEY`: the secret key of the same Turnstile widget that Supabase Auth's CAPTCHA uses (Cloudflare dashboard → Turnstile → the widget → its secret key), type **Secret** (write-only after saving; Vercel used to call these "Sensitive"). Never give it a `NEXT_PUBLIC_` name.
+   Then redeploy: changes apply only to new deployments.
+3. **Supabase, real project only.** SQL Editor → New query → paste `database/migrations/20261125_push_subscriptions.sql` → Run. The last statement should show `129944032`. Check again any time with `select public.push_cell(39.952, -75.164);` (expect `129944032`), and see the job with `select jobname, schedule from cron.job where jobname = 'purge-push-subscriptions';`.
+4. **Sender.** The next handoff adds the Edge Function that sends the pushes, and its steps.
+
 ## Done when
 
 Run these on two real phones (A and B) against the Supabase project before calling the frontend done.
@@ -776,7 +832,8 @@ Run these on two real phones (A and B) against the Supabase project before calli
 
 These are outside the MVP schema. Ask before building screens that need them.
 
-- **Stretch features with no tables yet:** notifications, local news, live streaming and translated text. Only `preferred_language` is stored. Light mode needs nothing from the database.
+- **Push alerts: server side only so far.** The table, its functions, the cleanup job, the server actions and the renew route are built (see "Push alerts" above). The service worker and the settings screens (next handoffs) and the Edge Function that sends the pushes are not.
+- **Stretch features with no tables yet:** local news, live streaming and translated text. Only `preferred_language` is stored. Light mode needs nothing from the database.
 - **Out of scope in the PRD:** comments and followers.
 - **No moderation:** there's no "report this pin" flow. For now, admins delete harmful posts in Supabase's Table Editor. A report button needs a new table, so ask first.
 - **Run the live checks before upgrading the live project.** The database was tested on a local copy, not on Supabase itself. `scripts/supabase-live-checks.mjs` runs against a scratch Supabase project set up like production (its header lists the settings) and checks what this design depends on: CAPTCHA and "Require current password" really on, anonymous sign-in with the new trigger on `auth.users`, saving an anonymous account, the `amr` claim after a sign-in and after a refresh, that a reset ends every session and that the old tokens of those sessions can't make a key or delete the account, that Supabase's own "forgot password" is refused by the hook and stores no code, and the delete rules. Supabase Auth's source already shows two of these: the current-password check applies only to users who already have a password (`internal/api/user.go`), and an admin password change logs out every session (`internal/api/admin.go` calls `UpdatePassword` with no session, which runs `Logout`). The hourly cleanup job also hasn't run on Supabase yet.
@@ -815,3 +872,9 @@ These are outside the MVP schema. Ask before building screens that need them.
 - [supabase/auth: user update and the current-password check (internal/api/user.go)](https://github.com/supabase/auth/blob/master/internal/api/user.go)
 - [supabase/auth: admin user update (internal/api/admin.go)](https://github.com/supabase/auth/blob/master/internal/api/admin.go)
 - [Cloudflare Turnstile: test keys](https://developers.cloudflare.com/turnstile/troubleshooting/testing/)
+- [Cloudflare Turnstile: server-side validation (siteverify)](https://developers.cloudflare.com/turnstile/get-started/server-side-validation/)
+- [Supabase: Cron quickstart (cron.schedule)](https://supabase.com/docs/guides/cron/quickstart)
+- [Vercel: Config and Secret environment variables](https://vercel.com/docs/environment-variables/sensitive-environment-variables)
+- [Vercel: Managing environment variables](https://vercel.com/docs/environment-variables/managing-environment-variables)
+- [PushForge builder: README (VAPID keys)](https://cdn.jsdelivr.net/npm/@pushforge/builder@2.0.4/README.md)
+- [Pushpad: what are the browser push services?](https://pushpad.xyz/blog/what-are-the-browser-push-services)

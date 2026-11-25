@@ -31,6 +31,11 @@
 //   replace_recovery_key;
 // - the admin API (secret key): list accounts, and set a password, which
 //   ends every session of that account.
+// Push alerts, as database/icepik_schema.sql, with the secret key only (any
+// other caller gets permission denied): push_create, push_update and
+// push_delete, in memory, with the SQL's results and errors (push_invalid,
+// push_endpoint_taken, a table check's 23514). Only the device secret's
+// SHA-256 is kept.
 // GET /__mock/requests lists the requests this project received (method,
 // path, and whether they used the secret key: never a body or a header), so
 // a check can prove the demo's reset never reached the real project.
@@ -297,6 +302,89 @@ async function accounts(req, url) {
   return [200, replaceKey(u)];
 }
 
+// Push alerts (push_subscriptions in database/icepik_schema.sql).
+const pushRows = new Map();
+const PUSH_ENDPOINT =
+  /^https:\/\/(fcm\.googleapis\.com|jmt17\.google\.com|web\.push\.apple\.com|updates\.push\.services\.mozilla\.com|[a-z0-9-]+\.notify\.windows\.com)\//;
+const pushHash = (secret) => (typeof secret === "string" ? createHash("sha256").update(secret, "utf8").digest("hex") : null);
+const plusDays = (days) => new Date(Date.now() + days * 86400000).toISOString().slice(0, 10);
+const checkViolation = () => dbError('new row for relation "push_subscriptions" violates check constraint', "23514");
+// push_clean_cells(): sorted, without repeats; push_invalid off the grid.
+function pushCleanCells(cells) {
+  if (cells === null || cells === undefined) return { cells: null };
+  if (!Array.isArray(cells)) return { error: dbError("malformed array literal", "22P02") };
+  if (cells.some((c) => !Number.isSafeInteger(c) || c < 0 || c > 180019999 || c % 20000 > 13846)) {
+    return { error: dbError("push_invalid") };
+  }
+  return { cells: [...new Set(cells)].sort((a, b) => a - b) };
+}
+// The table's checks.
+const pushRowOk = (r) =>
+  typeof r.endpoint === "string" &&
+  r.endpoint.length <= 1024 &&
+  PUSH_ENDPOINT.test(r.endpoint) &&
+  typeof r.p256dh === "string" &&
+  /^[A-Za-z0-9_-]{87}$/.test(r.p256dh) &&
+  typeof r.auth === "string" &&
+  /^[A-Za-z0-9_-]{22}$/.test(r.auth) &&
+  r.cells.length >= 1 &&
+  r.cells.length <= 1000;
+
+async function push(req, url) {
+  const rpc = url.pathname.match(/^\/rest\/v1\/rpc\/(push_create|push_update|push_delete)$/);
+  if (!rpc || req.method !== "POST") return null;
+  const input = await readBody(req);
+  if (!isAdmin(req)) return dbError(`permission denied for function ${rpc[1]}`, "42501");
+
+  if (rpc[1] === "push_create") {
+    if (typeof input.p_secret !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(input.p_secret)) return dbError("push_invalid");
+    const clean = pushCleanCells(input.p_cells);
+    if (clean.error) return clean.error;
+    const row = {
+      id: randomUUID(),
+      endpoint: input.p_endpoint,
+      p256dh: input.p_p256dh,
+      auth: input.p_auth,
+      cells: clean.cells ?? [],
+      secretHash: pushHash(input.p_secret),
+      createdOn: plusDays(0),
+      expiresOn: plusDays(30),
+    };
+    if (!pushRowOk(row)) return checkViolation();
+    if ([...pushRows.values()].some((r) => r.endpoint === row.endpoint)) return dbError("push_endpoint_taken");
+    pushRows.set(row.id, row);
+    return [200, row.id];
+  }
+
+  const found = pushRows.get(input.p_id);
+  const matches = Boolean(found && pushHash(input.p_secret) !== null && found.secretHash === pushHash(input.p_secret));
+  if (rpc[1] === "push_delete") {
+    if (matches) pushRows.delete(found.id);
+    return [200, matches];
+  }
+
+  // push_update
+  const swap = [input.p_endpoint, input.p_p256dh, input.p_auth].map((v) => v === undefined || v === null);
+  if (swap[0] !== swap[1] || swap[0] !== swap[2]) return dbError("push_invalid");
+  const clean = pushCleanCells(input.p_cells);
+  if (clean.error) return clean.error;
+  if (!matches) return [200, false];
+  const next = {
+    ...found,
+    cells: clean.cells ?? found.cells,
+    endpoint: input.p_endpoint ?? found.endpoint,
+    p256dh: input.p_p256dh ?? found.p256dh,
+    auth: input.p_auth ?? found.auth,
+    expiresOn: plusDays(30),
+  };
+  if (!pushRowOk(next)) return checkViolation();
+  if ([...pushRows.values()].some((r) => r.id !== next.id && r.endpoint === next.endpoint)) {
+    return dbError("push_endpoint_taken");
+  }
+  pushRows.set(next.id, next);
+  return [200, true];
+}
+
 http
   .createServer(async (req, res) => {
     const h = {
@@ -321,7 +409,7 @@ http
     }
     requests.push({ method: req.method, path: url.pathname, secretKey: isAdmin(req) });
     if (requests.length > 5000) requests.shift();
-    const answer = await accounts(req, url);
+    const answer = (await accounts(req, url)) ?? (await push(req, url));
     if (answer) {
       const [code, json] = answer;
       res.writeHead(code, h);

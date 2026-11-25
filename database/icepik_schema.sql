@@ -3,8 +3,9 @@
 --
 -- How to run: Supabase Dashboard -> SQL Editor -> New query -> paste -> Run.
 -- Run it once on a fresh project. A project that already runs an earlier
--- version keeps its data with database/migrations/20261116_recovery_keys.sql
--- instead; never use the "Starting over" lines at the bottom on real data.
+-- version keeps its data with the files in database/migrations instead
+-- (20261116_recovery_keys.sql, then 20261125_push_subscriptions.sql); never
+-- use the "Starting over" lines at the bottom on real data.
 --
 -- Dashboard settings this schema expects (Authentication section):
 --   1. Sign In / Providers -> "Allow anonymous sign-ins": ON
@@ -62,6 +63,7 @@
 --   sighting_votes      confirm / dispute votes that drive the verification factor
 --   sighting_reporters  private link between a sighting and the user who posted it
 --   recovery_keys       a hash of each saved account's recovery key
+--   push_subscriptions  push endpoints for alerts, by coarse square only
 --
 -- Privacy model (PRD Part 5):
 --   * Nothing anyone else can read links a person to a place. Active
@@ -72,7 +74,9 @@
 --     demand) can't rebuild who reported what in the past.
 --   * Pin locations are rounded to about 100 m. Voter locations are used for
 --     the 1 km check and never stored. Saved places (home, work) never leave
---     the device: the app checks them against the pins it has loaded.
+--     the device: the app checks them against the pins it has loaded. For
+--     push alerts the server gets only the ~2.2 km squares around them,
+--     with no user id (push_subscriptions).
 --   * Supabase's request logs record each request's IP address, full URL and
 --     the user id from its session token, but not its body. So nothing that
 --     identifies a pin goes in a URL: deleting a post and changing settings
@@ -793,6 +797,210 @@ select cron.schedule('purge-expired-links', '0 * * * *', 'select public.purge_ex
 
 
 -- ---------------------------------------------------------------------
+-- Push alerts: subscriptions by coarse square, never by person or place
+-- ---------------------------------------------------------------------
+
+-- A phone that wants alerts sends its push endpoint and keys, a random
+-- device secret, and the squares ("cells") around the places it watches.
+-- A cell is a fixed square 0.020° of latitude by 0.026° of longitude, about
+-- 2.2 km x 2.2 km at 40°N. For each place the phone sends every square within
+-- its alert distance of the square that holds the place. That list depends
+-- only on which square the place is in, so this table can't place anyone
+-- more precisely than one square. The phone checks the exact distance itself
+-- and writes the alert text.
+-- No row holds a user id or a time of day, and a row expires 30 days after
+-- the app was last opened. Only the server (secret key) can call these
+-- functions: app/actions/push.ts checks a Turnstile token before
+-- push_create, and the device secret (kept here only as its SHA-256) guards
+-- push_update and push_delete. The sender (a Supabase Edge Function) uses
+-- push_targets and push_drop.
+
+-- Square id for a point. Must match cellOf() in lib/push-cells.ts.
+create function public.push_cell(p_lat double precision, p_lng double precision)
+returns bigint
+language sql immutable parallel safe
+set search_path = ''
+as $$
+  select ((round(p_lat * 1000)::bigint + 90000) / 20) * 20000
+       + ((round(p_lng * 1000)::bigint + 180000) / 26)
+$$;
+
+-- Only the push services of Chrome (FCM), Apple, Mozilla and Microsoft, so
+-- the sender can never be aimed at any other URL.
+create table public.push_subscriptions (
+  id          uuid primary key default gen_random_uuid(),
+  endpoint    text not null unique check (
+                char_length(endpoint) <= 1024 and endpoint ~
+                '^https://(fcm\.googleapis\.com|jmt17\.google\.com|web\.push\.apple\.com|updates\.push\.services\.mozilla\.com|[a-z0-9-]+\.notify\.windows\.com)/'),
+  p256dh      text not null check (p256dh ~ '^[A-Za-z0-9_-]{87}$'),
+  auth        text not null check (auth ~ '^[A-Za-z0-9_-]{22}$'),
+  cells       bigint[] not null check (cardinality(cells) between 1 and 1000),
+  secret_hash bytea not null check (octet_length(secret_hash) = 32),
+  created_on  date not null default current_date,      -- a date: no time of day
+  expires_on  date not null default current_date + 30   -- a date, for the same reason
+);
+create index push_subscriptions_cells_idx on public.push_subscriptions using gin (cells);
+alter table public.push_subscriptions enable row level security;   -- and no policies
+revoke all on public.push_subscriptions from anon, authenticated;
+
+-- The cells sorted, without repeats. Refuses ('push_invalid') a missing
+-- value or one outside the grid (rows 0 to 9000, columns 0 to 13846).
+create function public.push_clean_cells(p_cells bigint[])
+returns bigint[]
+language plpgsql immutable
+set search_path = ''
+as $$
+begin
+  if p_cells is null then
+    return null;
+  end if;
+  if exists (select 1 from unnest(p_cells) as c
+             where c is null or c < 0 or c > 180019999 or c % 20000 > 13846) then
+    raise exception 'push_invalid';
+  end if;
+  return array(select distinct c from unnest(p_cells) as c order by c);
+end;
+$$;
+
+-- A new subscription; returns its id. The secret is 32 random bytes in
+-- base64url (43 characters); only its SHA-256 is kept. An endpoint that
+-- another row already holds raises 'push_endpoint_taken'.
+create function public.push_create(p_endpoint text, p_p256dh text, p_auth text, p_cells bigint[], p_secret text)
+returns uuid
+language plpgsql
+volatile
+security definer set search_path = ''
+as $$
+declare
+  v_id uuid;
+begin
+  if p_secret is null or p_secret !~ '^[A-Za-z0-9_-]{43}$' then
+    raise exception 'push_invalid';
+  end if;
+
+  insert into public.push_subscriptions (endpoint, p256dh, auth, cells, secret_hash)
+  values (p_endpoint, p_p256dh, p_auth, public.push_clean_cells(p_cells),
+          pg_catalog.sha256(pg_catalog.convert_to(p_secret, 'UTF8')))
+  on conflict (endpoint) do nothing
+  returning id into v_id;
+
+  if v_id is null then
+    raise exception 'push_endpoint_taken';
+  end if;
+  return v_id;
+end;
+$$;
+
+-- Renew a subscription for 30 more days, and optionally replace its cells
+-- or swap its push endpoint (endpoint, p256dh and auth together, or none).
+-- False when the id or the secret doesn't match; a new endpoint that another
+-- row holds raises 'push_endpoint_taken'.
+create function public.push_update(
+  p_id uuid,
+  p_secret text,
+  p_cells bigint[] default null,
+  p_endpoint text default null,
+  p_p256dh text default null,
+  p_auth text default null)
+returns boolean
+language plpgsql
+volatile
+security definer set search_path = ''
+as $$
+begin
+  if (p_endpoint is null) <> (p_p256dh is null) or (p_endpoint is null) <> (p_auth is null) then
+    raise exception 'push_invalid';
+  end if;
+
+  update public.push_subscriptions s
+  set cells      = coalesce(public.push_clean_cells(p_cells), s.cells),
+      endpoint   = coalesce(p_endpoint, s.endpoint),
+      p256dh     = coalesce(p_p256dh, s.p256dh),
+      auth       = coalesce(p_auth, s.auth),
+      expires_on = current_date + 30
+  where s.id = p_id
+    and s.secret_hash = pg_catalog.sha256(pg_catalog.convert_to(p_secret, 'UTF8'));
+  return found;
+exception
+  when unique_violation then
+    raise exception 'push_endpoint_taken';
+end;
+$$;
+
+-- Delete a subscription. False when the id or the secret doesn't match.
+create function public.push_delete(p_id uuid, p_secret text)
+returns boolean
+language plpgsql
+volatile
+security definer set search_path = ''
+as $$
+begin
+  delete from public.push_subscriptions s
+  where s.id = p_id
+    and s.secret_hash = pg_catalog.sha256(pg_catalog.convert_to(p_secret, 'UTF8'));
+  return found;
+end;
+$$;
+
+-- For the sender: the live subscriptions whose cells hold a sighting's
+-- square, a page at a time (at most 500), in id order. Pass the last id of
+-- one page as p_after to get the next.
+create function public.push_targets(p_lat double precision, p_lng double precision, p_after uuid, p_limit int)
+returns table (id uuid, endpoint text, p256dh text, auth text)
+language sql
+stable
+security definer set search_path = ''
+as $$
+  select s.id, s.endpoint, s.p256dh, s.auth
+  from public.push_subscriptions s
+  where s.cells @> array[public.push_cell(p_lat, p_lng)]
+    and s.expires_on >= current_date
+    and (p_after is null or s.id > p_after)
+  order by s.id
+  limit least(greatest(p_limit, 1), 500);
+$$;
+
+-- For the sender: forget subscriptions whose push service answered that
+-- they are gone (404 or 410).
+create function public.push_drop(p_ids uuid[])
+returns void
+language sql
+volatile
+security definer set search_path = ''
+as $$
+  delete from public.push_subscriptions where id = any(p_ids);
+$$;
+
+-- Daily cleanup: subscriptions not renewed for 30 days.
+create function public.push_purge()
+returns void
+language sql
+volatile
+security definer set search_path = ''
+as $$
+  delete from public.push_subscriptions where expires_on < current_date;
+$$;
+
+-- Postgres grants EXECUTE to PUBLIC by default, so revoke first.
+revoke execute on function public.push_cell(double precision, double precision) from public, anon, authenticated;
+revoke execute on function public.push_clean_cells(bigint[]) from public, anon, authenticated;
+revoke execute on function public.push_create(text, text, text, bigint[], text) from public, anon, authenticated;
+revoke execute on function public.push_update(uuid, text, bigint[], text, text, text) from public, anon, authenticated;
+revoke execute on function public.push_delete(uuid, text) from public, anon, authenticated;
+revoke execute on function public.push_targets(double precision, double precision, uuid, int) from public, anon, authenticated;
+revoke execute on function public.push_drop(uuid[]) from public, anon, authenticated;
+revoke execute on function public.push_purge() from public, anon, authenticated;
+grant execute on function public.push_create(text, text, text, bigint[], text) to service_role;
+grant execute on function public.push_update(uuid, text, bigint[], text, text, text) to service_role;
+grant execute on function public.push_delete(uuid, text) to service_role;
+grant execute on function public.push_targets(double precision, double precision, uuid, int) to service_role;
+grant execute on function public.push_drop(uuid[]) to service_role;
+
+-- Every day at 04:17 UTC, after pg_cron is set up above.
+select cron.schedule('purge-push-subscriptions', '17 4 * * *', 'select public.push_purge()');
+
+
+-- ---------------------------------------------------------------------
 -- Row Level Security
 -- ---------------------------------------------------------------------
 
@@ -871,6 +1079,6 @@ alter publication supabase_realtime add table public.sightings;
 -- database/migrations/20261116_recovery_keys.sql instead.
 -- =====================================================================
 
--- drop table if exists public.recovery_keys, public.sighting_votes, public.sighting_reporters, public.sightings, public.profiles cascade;
--- drop function if exists public.handle_new_user, public.prepare_new_sighting, public.record_sighting_reporter, public.refresh_sighting_votes, public.sightings_near, public.distance_m, public.vote_on_sighting, public.delete_my_account, public.delete_my_sighting, public.set_my_language, public.block_auth_emails, public.signed_in_with_password_recently, public.create_recovery_key, public.has_recovery_key, public.replace_recovery_key, public.check_recovery_key, public.check_login_id, public.purge_expired_links, public.can_vote_on cascade;
+-- drop table if exists public.push_subscriptions, public.recovery_keys, public.sighting_votes, public.sighting_reporters, public.sightings, public.profiles cascade;
+-- drop function if exists public.handle_new_user, public.prepare_new_sighting, public.record_sighting_reporter, public.refresh_sighting_votes, public.sightings_near, public.distance_m, public.vote_on_sighting, public.delete_my_account, public.delete_my_sighting, public.set_my_language, public.block_auth_emails, public.signed_in_with_password_recently, public.create_recovery_key, public.has_recovery_key, public.replace_recovery_key, public.check_recovery_key, public.check_login_id, public.purge_expired_links, public.can_vote_on, public.push_cell, public.push_clean_cells, public.push_create, public.push_update, public.push_delete, public.push_targets, public.push_drop, public.push_purge cascade;
 -- drop type if exists public.sighting_category, public.vote_type cascade;
