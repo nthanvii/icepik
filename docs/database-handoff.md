@@ -799,17 +799,103 @@ See the table under "Server functions" above. In short: `push_create`, `push_upd
 
 Do these on your own computer and in the dashboards. The real project only: `/demo` has no push alerts, so never run the push migration on the demo project.
 
-1. **VAPID keys.** On your own computer, run `npx @pushforge/builder vapid`. It prints a public key (for the app) and a private key in JWK format (for the sender). Keep the private key out of Vercel, the repository and chats; step 2 of "The sender" below says where it goes.
+1. **VAPID keys.** On your own computer, make a key pair with Node 20 or later (the app already needs it); nothing is added to the repository. Save this as `vapid-keys.mjs` in a folder outside the repository (your Desktop, say) and run `node vapid-keys.mjs` there:
+
+   ```js
+   // vapid-keys.mjs: makes a VAPID key pair (ES256, P-256) with Node's built-in WebCrypto.
+   const { publicKey, privateKey } = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
+   const jwk = await crypto.subtle.exportKey("jwk", privateKey);
+   const point = new Uint8Array(await crypto.subtle.exportKey("raw", publicKey));
+   console.log("Public key (NEXT_PUBLIC_VAPID_PUBLIC_KEY, for Vercel):");
+   console.log(Buffer.from(point).toString("base64url"));
+   console.log("\nPrivate key (VAPID_PRIVATE_JWK, for Supabase):");
+   console.log(JSON.stringify({ alg: "ES256", ...jwk }));
+   ```
+
+   It prints a public key (87 characters, for the app) and a private key as one line of JWK JSON (for the sender). Keep the private key out of Vercel, the repository and chats; step 2 of "The sender" below says where it goes. Make the pair once: a new pair makes every saved subscription useless (see "What to know" below).
 2. **Vercel.** In the project, open Settings → Environment Variables, and add for the **Production** environment:
    - `NEXT_PUBLIC_VAPID_PUBLIC_KEY`: the public key from step 1, type **Config** (it's built into the page, so it isn't secret).
    - `TURNSTILE_SECRET_KEY`: the secret key of the same Turnstile widget that Supabase Auth's CAPTCHA uses (Cloudflare dashboard → Turnstile → the widget → its secret key), type **Secret** (write-only after saving; Vercel used to call these "Sensitive"). Never give it a `NEXT_PUBLIC_` name.
    Then redeploy: changes apply only to new deployments.
 3. **Supabase, real project only.** SQL Editor → New query → paste `database/migrations/20261125_push_subscriptions.sql` → Run. The last statement should show `129944032`. Check again any time with `select public.push_cell(39.952, -75.164);` (expect `129944032`), and see the job with `select jobname, schedule from cron.job where jobname = 'purge-push-subscriptions';`.
-4. **Sender.** Deploy the `push-sightings` Edge Function and create its webhook: see "The sender" below.
+4. **Check after the migration.** The migration was tried only in a stand-in Postgres (a test copy of Supabase's roles, with `pg_cron` replaced), so confirm the real project before going on. SQL Editor → New query → paste this → Run. It only reads:
+
+   ```sql
+   select n, "check", result, should_be, result = should_be as ok
+   from (
+     select 1 as n, 'RLS is on for push_subscriptions' as "check",
+            (select relrowsecurity::text from pg_class where oid = 'public.push_subscriptions'::regclass) as result,
+            'true' as should_be
+     union all
+     select 2, 'row policies on push_subscriptions',
+            (select count(*)::text from pg_policies where schemaname = 'public' and tablename = 'push_subscriptions'),
+            '0'
+     union all
+     select 3, 'anon has a table privilege on push_subscriptions',
+            has_table_privilege('anon', 'public.push_subscriptions', 'select,insert,update,delete,truncate,references,trigger')::text,
+            'false'
+     union all
+     select 4, 'authenticated has a table privilege on push_subscriptions',
+            has_table_privilege('authenticated', 'public.push_subscriptions', 'select,insert,update,delete,truncate,references,trigger')::text,
+            'false'
+     union all
+     select 5, 'anon or authenticated has a column privilege on push_subscriptions',
+            (has_any_column_privilege('anon', 'public.push_subscriptions', 'select,insert,update,references')
+             or has_any_column_privilege('authenticated', 'public.push_subscriptions', 'select,insert,update,references'))::text,
+            'false'
+     union all
+     select 6, 'push functions in public',
+            (select count(*)::text from pg_proc p join pg_namespace s on s.oid = p.pronamespace
+              where s.nspname = 'public' and p.proname like 'push\_%'),
+            '8'
+     union all
+     select 7, 'push functions anon can execute',
+            (select count(*)::text from pg_proc p join pg_namespace s on s.oid = p.pronamespace
+              where s.nspname = 'public' and p.proname like 'push\_%' and has_function_privilege('anon', p.oid, 'execute')),
+            '0'
+     union all
+     select 8, 'push functions authenticated can execute',
+            (select count(*)::text from pg_proc p join pg_namespace s on s.oid = p.pronamespace
+              where s.nspname = 'public' and p.proname like 'push\_%' and has_function_privilege('authenticated', p.oid, 'execute')),
+            '0'
+     union all
+     select 9, 'of push_create, push_update, push_delete, push_targets and push_drop, how many service_role can execute',
+            (select count(*)::text from pg_proc p join pg_namespace s on s.oid = p.pronamespace
+              where s.nspname = 'public'
+                and p.proname in ('push_create', 'push_update', 'push_delete', 'push_targets', 'push_drop')
+                and has_function_privilege('service_role', p.oid, 'execute')),
+            '5'
+     union all
+     select 10, 'cron job purge-push-subscriptions',
+            (select coalesce(string_agg(schedule || case when active then ' (active)' else ' (not active)' end, ', '), 'missing')
+               from cron.job where jobname = 'purge-push-subscriptions'),
+            '17 4 * * * (active)'
+     union all
+     select 11, 'push_cell(39.952, -75.164)', public.push_cell(39.952, -75.164)::text, '129944032'
+   ) as checks
+   order by n;
+   ```
+
+   It returns 11 rows, and the `ok` column of every row should be `true`. If any row says `false`, stop: don't deploy the sender or turn on alerts until it is fixed (ask the backend owner, or re-run the migration, which is safe to run twice). What each row should show:
+
+   | Row | Should be | What it proves |
+   | --- | --- | --- |
+   | 1 | `true` | Row-level security is on for `push_subscriptions` |
+   | 2 | `0` | There are no row policies, so with RLS on the browser roles can read or write no row |
+   | 3, 4 | `false` | `anon` and `authenticated` have no privilege on the table (no select, insert, update, delete, truncate, references or trigger) |
+   | 5 | `false` | ...and none on any single column of it |
+   | 6 | `8` | The push functions are all there: `push_cell`, `push_clean_cells`, `push_create`, `push_update`, `push_delete`, `push_targets`, `push_drop` and `push_purge` (a later handoff that adds one makes this number go up: expected then) |
+   | 7, 8 | `0` | Neither `anon` nor `authenticated` can run any push function |
+   | 9 | `5` | `service_role`, which the secret key uses, can run the five it needs: `push_create`, `push_update`, `push_delete`, `push_targets` and `push_drop` |
+   | 10 | `17 4 * * * (active)` | The daily cleanup job exists, runs at 04:17 UTC and is on (`missing` or `(not active)` means it didn't get scheduled: see step 3) |
+   | 11 | `129944032` | The square for (39.952, −75.164) is the one `lib/push-cells.ts` gives |
+
+   `service_role` may also be able to run `push_cell`, `push_clean_cells` and `push_purge`, because Supabase gives it new functions by default. That is harmless (the secret key skips every rule anyway) and isn't checked.
+5. **Sender.** Deploy the `push-sightings` Edge Function and create its webhook: see "The sender" below.
 
 ### The sender: the `push-sightings` Edge Function
 
-`supabase/functions/push-sightings/index.ts` sends the alerts. A database webhook calls it after every new pin. It checks the secret header, answers `ok` at once, and then, in the background, asks `push_targets` for the first 200 subscriptions whose squares hold the pin's square. It sends each one an encrypted push (TTL 1 hour, urgency high, no topic, 20 at a time) and deletes the ones whose push service answers 404 or 410 with `push_drop`. If the page was full, it calls itself for the next 200. A 429, a 5xx answer or a network error is retried twice, after the `Retry-After` wait (at most 10 s) or else 2 s and then 6 s. It starts no push request more than 100 s into a call, and a message that still fails is dropped, not kept. Everyone gets the same message: `{ "v": 1, "id", "lat", "lng", "cat", "at", "pad" }`, the pin's rounded point, category, time and id, padded with spaces to exactly 512 characters.
+`supabase/functions/push-sightings/index.ts` sends the alerts, and `webpush.ts` beside it encrypts and signs each message with the runtime's built-in WebCrypto (no package is used). A database webhook calls the function after every new pin. It checks the secret header, answers `ok` at once, and then, in the background, asks `push_targets` for the first 200 subscriptions whose squares hold the pin's square. For each one it first checks the endpoint against the same list of push services as the table and `app/actions/push.ts` (a mismatch counts as failed and is never contacted), then encrypts the message for that subscription (`aes128gcm`, RFC 8291, one record padded as RFC 8188 describes to a fixed size, so every body is 1,126 octets whatever the text), signs a VAPID token (RFC 8292, ES256) and sends it (TTL 1 hour, urgency high, no topic, 20 at a time). There is one token for each push service's origin, made on first use and kept for the life of the function instance (it expires after 12 hours, within the 24 allowed), because Apple asks senders not to refresh a token more than once an hour. The function deletes the subscriptions whose push service answers 404 or 410 with `push_drop`. If the page was full, it calls itself for the next 200, and tries that call once more if it fails. A 429, a 5xx answer or a network error on a push is retried twice, after the `Retry-After` wait (at most 10 s) or else 2 s and then 6 s. It starts no push request more than 100 s into a call, and a message that still fails is dropped, not kept. Everyone gets the same message: `{ "v": 1, "id", "lat", "lng", "cat", "at", "pad" }`, the pin's rounded point, category, time and id, padded with spaces to exactly 512 characters.
 
 It writes one log line per call, `{"event":"push-sightings","sent":n,"dropped":n,"failed":n,"next":true|false}`, and two error lines: `{"event":"push-sightings","error":"not_configured"}` (a secret is missing or malformed) and `{"event":"push-sightings","error":"unexpected"}` (anything else went wrong; it holds no detail on purpose, because errors from `fetch` contain the push endpoint). It never logs or returns an endpoint, key, coordinate, pin id or anything a push service said, and its answer is always one word: `ok`, `ignored`, `unauthorized` or `error`.
 
@@ -836,7 +922,7 @@ Do these on your own computer, in the real project only. The Supabase CLI runs w
      -d '{"type":"INSERT","table":"sightings","record":{"id":"00000000-0000-4000-8000-000000000001","lat":39.952,"lng":-75.164,"category":"other","created_at":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"}}'
    ```
 
-   Expect `200` and the body `ok`, an alert on the test phone within seconds, and in Dashboard → Edge Functions → push-sightings → Logs one line such as `{"event":"push-sightings","sent":1,"dropped":0,"failed":0,"next":false}`. With a wrong or missing `x-icepik-webhook` header the answer is `401` and `unauthorized`, and nothing is sent. A made-up pin that is valid but matches no phone logs `"sent":0`. Try an iPhone with the app on the Home Screen first: the sender library (`@pushforge/builder` 2.0.5) uses the older `aesgcm` content encoding, which Chrome and Firefox accept, but Apple's documentation doesn't list which encodings Safari accepts.
+   Expect `200` and the body `ok`, an alert on the test phone within seconds, and in Dashboard → Edge Functions → push-sightings → Logs one line such as `{"event":"push-sightings","sent":1,"dropped":0,"failed":0,"next":false}`. With a wrong or missing `x-icepik-webhook` header the answer is `401` and `unauthorized`, and nothing is sent. A made-up pin that is valid but matches no phone logs `"sent":0`. Try an iPhone with the app on the Home Screen first: the encryption and the signing follow RFC 8291 and RFC 8292 and reproduce the RFC's own worked example, but they haven't met a real push service yet.
 5. **Create the webhook, real project only** (never the demo or a scratch project: it would send pushes for their pins too). Dashboard → Database → Webhooks → Create a new hook:
    - Name `push_sightings`; Table `public.sightings`; Events: **Insert** only.
    - Type of webhook: **Supabase Edge Functions** and pick `push-sightings` (or **HTTP Request** with method `POST` and the URL `https://<project-ref>.supabase.co/functions/v1/push-sightings`).
@@ -847,9 +933,9 @@ Do these on your own computer, in the real project only. The Supabase CLI runs w
 
 What to know:
 
-- **Free plan.** A call may use 2 s of CPU and 150 s of wall time, and the plan gives 500,000 calls a month. In the local test one message cost about 2.3 to 3.7 ms of CPU, so a 200-subscriber page takes roughly 0.5 to 0.9 s. A pin costs one call plus one more for every further 200 subscribers.
-- **Long chains.** Supabase's limits page lists "recursive calls: 30 requests per trace in a 60-second window". If that applies to the function calling itself, alerts for one pin would stop after about 6,000 subscribers. Watch this if the number of subscriptions grows.
-- **No second chances.** A follow-on call that fails isn't retried (the rest of that pin's subscribers get no alert), and a push that still fails after its retries is dropped.
+- **Free plan.** A call may use 2 s of CPU and 150 s of wall time, and the plan gives 500,000 calls a month. In the local test one message cost about 1.5 to 1.6 ms of CPU (encrypting and signing alone, 1.0 to 1.1 ms), so a 200-subscriber page takes roughly 0.3 s. A pin costs one call plus one more for every further 200 subscribers.
+- **Long chains.** Supabase's limits page lists "recursive calls: 30 requests per trace in a 60-second window" ([recursive calls](https://supabase.com/docs/guides/functions/recursive-functions)). If that applies to the function calling itself, alerts for one pin would stop after about 6,000 subscribers. Watch this if the number of subscriptions grows. The one retry of a failed follow-on call counts toward the same 30, so a chain where calls fail reaches fewer subscribers.
+- **No second chances.** A follow-on call that fails is tried once more (after the `Retry-After` of a 429, the wait in a rate-limit error, or else 2 s), and that retry counts toward the 30 above. If it fails too, the rest of that pin's subscribers get no alert. A push that still fails after its retries is dropped.
 - **Rotating the VAPID key** makes every saved subscription useless, since phones accept only the key they subscribed with: they have to subscribe again.
 
 ## Done when
@@ -923,5 +1009,8 @@ These are outside the MVP schema. Ask before building screens that need them.
 - [Supabase: Cron quickstart (cron.schedule)](https://supabase.com/docs/guides/cron/quickstart)
 - [Vercel: Config and Secret environment variables](https://vercel.com/docs/environment-variables/sensitive-environment-variables)
 - [Vercel: Managing environment variables](https://vercel.com/docs/environment-variables/managing-environment-variables)
-- [PushForge builder: README (VAPID keys)](https://cdn.jsdelivr.net/npm/@pushforge/builder@2.0.4/README.md)
+- [RFC 8188: Encrypted Content-Encoding for HTTP](https://www.rfc-editor.org/rfc/rfc8188)
+- [RFC 8291: Message Encryption for Web Push (its section 5 is the worked example)](https://www.rfc-editor.org/rfc/rfc8291)
+- [RFC 8292: VAPID for Web Push](https://www.rfc-editor.org/rfc/rfc8292)
+- [Supabase: Recursive / nested function calls](https://supabase.com/docs/guides/functions/recursive-functions)
 - [Pushpad: what are the browser push services?](https://pushpad.xyz/blog/what-are-the-browser-push-services)

@@ -9,14 +9,16 @@
 // Rules for this file:
 // - Log only the fixed lines in logSummary() and logError(). Never log an
 //   endpoint, key, coordinate, id, error object or error message: Deno's fetch
-//   errors, and pushforge's, contain the URL.
+//   errors contain the URL.
 // - Never read, return or log what a push service answers. Only its status
 //   code is used.
+// - Messages are encrypted and signed in ./webpush.ts with WebCrypto only: no
+//   package is imported.
 // - Every response body is one of: ok, ignored, unauthorized, error.
 // - JWT verification is off for this function (see docs/database-handoff.md);
 //   the secret header is its only check.
 
-import { buildPushHTTPRequest } from "npm:@pushforge/builder@2.0.5";
+import { encrypt, fromBase64Url, vapidAuthorization } from "./webpush.ts";
 
 const NAME = "push-sightings";
 const SECRET_HEADER = "x-icepik-webhook";
@@ -25,6 +27,7 @@ const PAGE_SIZE = 200; // subscriptions per call
 const IN_FLIGHT = 20; // push requests at once
 const TTL_SECONDS = 3600;
 const PAYLOAD_CHARS = 512; // JSON.stringify(payload).length, space-padded
+const PADDED_BYTES = 1024; // every record is padded (RFC 8188) to this size before encryption
 const GIVE_UP_MS = 100_000; // start no push request later than this into a call
 const REQUEST_TIMEOUT_MS = 10_000;
 const MAX_RETRY_WAIT_MS = 10_000;
@@ -32,6 +35,13 @@ const RETRY_WAITS_MS = [2_000, 6_000]; // two retries after the first try
 
 const CATEGORIES = new Set(["patrol", "vehicle", "checkpoint", "raid", "other"]);
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// The push services of Chrome (FCM, and Google's jmt17 host), Apple, Mozilla
+// and Microsoft: the same list as ENDPOINT in app/actions/push.ts and the
+// table's check in database/icepik_schema.sql. Keep the three in step. Checked
+// again here so this function can never be aimed at another URL.
+const ENDPOINT =
+  /^https:\/\/(fcm\.googleapis\.com|jmt17\.google\.com|web\.push\.apple\.com|updates\.push\.services\.mozilla\.com|[a-z0-9-]+\.notify\.windows\.com)\/[\x21-\x7e]*$/;
+const MAX_ENDPOINT_LENGTH = 1024;
 
 // Exists only on Supabase's runtime.
 declare const EdgeRuntime: { waitUntil(promise: Promise<unknown>): void } | undefined;
@@ -140,6 +150,7 @@ function readConfig(): Config | null {
 
     const jwk = JSON.parse(jwkText); // once per call
     if (!isRecord(jwk) || jwk.kty !== "EC" || typeof jwk.d !== "string") return null;
+    if (typeof jwk.x !== "string" || typeof jwk.y !== "string") return null;
 
     return {
       url: new URL(url).origin,
@@ -220,7 +231,7 @@ function round3(value: number): number {
 // Never rejects: anything unexpected becomes the one error line.
 async function runJob(config: Config, job: Job, startedAt: number): Promise<void> {
   try {
-    const payload = buildPayload(job.sighting);
+    const plaintext = buildPayload(job.sighting);
 
     const targets = await fetchTargets(config, job);
     if (!targets) throw new Error("targets");
@@ -231,7 +242,7 @@ async function runJob(config: Config, job: Job, startedAt: number): Promise<void
     if (full) {
       const last = targets[targets.length - 1];
       if (!isRecord(last) || typeof last.id !== "string" || !UUID.test(last.id)) throw new Error("page");
-      startNext(config, job.sighting, last.id);
+      startNext(config, job.sighting, last.id, startedAt);
     }
 
     const usable: Target[] = [];
@@ -250,7 +261,7 @@ async function runJob(config: Config, job: Job, startedAt: number): Promise<void
     let sent = 0;
     const gone: string[] = [];
     await inParallel(usable, IN_FLIGHT, async (target) => {
-      const outcome = await deliver(config, payload, target, startedAt);
+      const outcome = await deliver(config, plaintext, target, startedAt);
       if (outcome === "sent") sent++;
       else if (outcome === "gone") gone.push(target.id);
       else failed++;
@@ -271,8 +282,8 @@ async function runJob(config: Config, job: Job, startedAt: number): Promise<void
 
 // The same text for everyone: the rounded point, category, time and sighting
 // id, padded with spaces to a fixed length so its size reveals nothing.
-// The phone's service worker reads these exact names.
-function buildPayload(sighting: Sighting) {
+// The phone's service worker reads these exact names. Returns its UTF-8 bytes.
+function buildPayload(sighting: Sighting): Uint8Array<ArrayBuffer> {
   const payload = {
     v: 1,
     id: sighting.id,
@@ -285,8 +296,9 @@ function buildPayload(sighting: Sighting) {
   const room = PAYLOAD_CHARS - JSON.stringify(payload).length;
   if (room < 0) throw new Error("payload");
   payload.pad = " ".repeat(room);
-  if (JSON.stringify(payload).length !== PAYLOAD_CHARS) throw new Error("payload");
-  return payload;
+  const json = JSON.stringify(payload);
+  if (json.length !== PAYLOAD_CHARS) throw new Error("payload");
+  return new TextEncoder().encode(json);
 }
 
 async function fetchTargets(config: Config, job: Job): Promise<unknown[] | null> {
@@ -299,30 +311,45 @@ async function fetchTargets(config: Config, job: Job): Promise<unknown[] | null>
   return result.ok && Array.isArray(result.data) ? result.data : null;
 }
 
-// Starts this function again for the page after `after`.
-function startNext(config: Config, sighting: Sighting, after: string) {
+// Starts this function again for the page after `after`. A failed call is
+// tried once more, after the Retry-After wait on a 429 (at most 10 s), or the
+// retryAfterMs that Supabase's runtime puts on the error it throws when
+// function-to-function calls go over its limit, or else 2 s.
+function startNext(config: Config, sighting: Sighting, after: string, startedAt: number) {
+  const body = JSON.stringify({
+    next: {
+      sighting: {
+        id: sighting.id,
+        lat: sighting.lat,
+        lng: sighting.lng,
+        category: sighting.category,
+        created_at: sighting.at,
+      },
+      after,
+    },
+  });
   background((async () => {
-    try {
-      const res = await fetch(`${config.url}/functions/v1/${NAME}`, {
-        method: "POST",
-        headers: { "content-type": "application/json", [SECRET_HEADER]: config.secret },
-        body: JSON.stringify({
-          next: {
-            sighting: {
-              id: sighting.id,
-              lat: sighting.lat,
-              lng: sighting.lng,
-              category: sighting.category,
-              created_at: sighting.at,
-            },
-            after,
-          },
-        }),
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-      });
-      await res.body?.cancel().catch(() => {});
-    } catch {
-      // Not logged: the error text holds the URL.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      let wait = retryDelayMs(null, 0);
+      try {
+        const res = await fetch(`${config.url}/functions/v1/${NAME}`, {
+          method: "POST",
+          headers: { "content-type": "application/json", [SECRET_HEADER]: config.secret },
+          body,
+          signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+        });
+        const status = res.status;
+        const retryAfter = res.headers.get("retry-after");
+        await res.body?.cancel().catch(() => {});
+        if (status >= 200 && status < 300) return;
+        if (status === 429) wait = retryDelayMs(retryAfter, 0);
+      } catch (error) {
+        // Never logged: the message holds the URL. Only the wait is read from it.
+        const ms = (error as { retryAfterMs?: unknown } | null)?.retryAfterMs;
+        if (typeof ms === "number" && Number.isFinite(ms)) wait = Math.min(Math.max(ms, 0), MAX_RETRY_WAIT_MS);
+      }
+      if (attempt === 1 || Date.now() - startedAt >= GIVE_UP_MS) return;
+      await sleep(wait);
     }
   })());
 }
@@ -330,20 +357,28 @@ function startNext(config: Config, sighting: Sighting, after: string) {
 // ---------------------------------------------------------------- sending
 
 // Never throws.
-async function deliver(config: Config, payload: object, target: Target, startedAt: number): Promise<Outcome> {
-  let request: { endpoint: string; headers: HeadersInit; body: BodyInit };
+async function deliver(config: Config, plaintext: Uint8Array<ArrayBuffer>, target: Target, startedAt: number): Promise<Outcome> {
+  // Only the push services the table allows. A mismatch is counted as failed.
+  if (target.endpoint.length > MAX_ENDPOINT_LENGTH || !ENDPOINT.test(target.endpoint)) return "failed";
+
+  let headers: Record<string, string>;
+  let body: Uint8Array<ArrayBuffer>;
   try {
-    request = await buildPushHTTPRequest({
-      privateJWK: config.jwk,
-      subscription: { endpoint: target.endpoint, keys: { p256dh: target.p256dh, auth: target.auth } },
-      message: {
-        payload: payload as Record<string, string | number>,
-        adminContact: config.subject,
-        options: { ttl: TTL_SECONDS, urgency: "high" }, // no topic
-      },
+    body = await encrypt({
+      uaPublic: fromBase64Url(target.p256dh),
+      authSecret: fromBase64Url(target.auth),
+      plaintext,
+      paddedBytes: PADDED_BYTES,
     });
+    headers = {
+      Authorization: await vapidAuthorization(config.jwk, config.subject, new URL(target.endpoint).origin),
+      "Content-Encoding": "aes128gcm",
+      "Content-Type": "application/octet-stream",
+      TTL: String(TTL_SECONDS),
+      Urgency: "high", // no Topic
+    };
   } catch {
-    return "failed"; // bad keys or endpoint: retrying won't help
+    return "failed"; // bad keys: retrying won't help
   }
 
   for (let attempt = 0;; attempt++) {
@@ -353,10 +388,10 @@ async function deliver(config: Config, payload: object, target: Target, startedA
     let status = 0; // 0 = no answer (network error or timeout)
     let retryAfter: string | null = null;
     try {
-      const res = await fetch(request.endpoint, {
+      const res = await fetch(target.endpoint, {
         method: "POST",
-        headers: request.headers,
-        body: request.body,
+        headers,
+        body,
         redirect: "manual",
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
