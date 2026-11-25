@@ -338,12 +338,14 @@ import type { Database } from '@/database.types'
 
 /**
  * Supabase client with the SECRET key. It skips every database rule, so it is
- * used in exactly one place: the password reset in app/actions/recovery.ts.
- * Never import it anywhere else, and never give the key a NEXT_PUBLIC_ name.
+ * used in exactly two places: account recovery (the password reset in
+ * app/actions/recovery.ts) and push alerts (app/actions/push.ts, which
+ * app/api/push/renew/route.ts calls). Never import it anywhere else, and never
+ * give the key a NEXT_PUBLIC_ name.
  *
  * SUPABASE_SECRET_KEY is set in Vercel's Production environment only, marked
- * Sensitive. Preview deployments don't get it, so there this returns null and
- * the reset says it isn't available.
+ * Sensitive. Preview deployments don't get it, so there this returns null, and
+ * the reset and push alerts say they aren't available.
  */
 export function createAdminClient() {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL

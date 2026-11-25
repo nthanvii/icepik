@@ -5,9 +5,10 @@ import { demoSupabaseUrl, supabaseUrl } from "./config";
 
 /**
  * Supabase clients with a SECRET key. They skip every database rule, so they
- * are used in exactly one place: the password reset in app/actions/recovery.ts.
- * Never import this file anywhere else, and never give a secret key a
- * NEXT_PUBLIC_ name.
+ * are used in exactly two places: account recovery (the password reset in
+ * app/actions/recovery.ts) and push alerts (app/actions/push.ts, which
+ * app/api/push/renew/route.ts calls). Never import this file anywhere else,
+ * and never give a secret key a NEXT_PUBLIC_ name.
  */
 
 const options = { auth: { persistSession: false, autoRefreshToken: false } };
@@ -15,7 +16,8 @@ const options = { auth: { persistSession: false, autoRefreshToken: false } };
 /**
  * The real project. SUPABASE_SECRET_KEY is set in Vercel's Production
  * environment only, marked Sensitive. Preview deployments don't get it, so
- * there this returns null and the reset says it isn't available.
+ * there this returns null, and the reset and push alerts say they aren't
+ * available.
  */
 export function createAdminClient() {
   const secretKey = process.env.SUPABASE_SECRET_KEY;
