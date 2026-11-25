@@ -122,7 +122,7 @@ The app reads active pins (signed in or not) and inserts new ones. It deletes it
 | `push_create(p_endpoint, p_p256dh, p_auth, p_cells, p_secret)` | Server only (secret key) | Called by `createPushSubscription` after its Turnstile check. Saves a subscription and returns its id; `push_endpoint_taken` if the endpoint is already saved |
 | `push_update(p_id, p_secret, p_cells?, p_endpoint?, p_p256dh?, p_auth?)` | Server only (secret key) | Called by `updatePushSubscription` and `POST /api/push/renew`. Renews for 30 days, and replaces the cells or swaps the endpoint and keys (all three together); false when the id or secret doesn't match |
 | `push_delete(p_id, p_secret)` | Server only (secret key) | Called by `deletePushSubscription`. False when the id or secret doesn't match |
-| `push_targets(p_lat, p_lng, p_after, p_limit)` | Server only (secret key) | For the sender (an Edge Function, next handoff): the live subscriptions whose cells hold a sighting's square, at most 500 per page, in id order |
+| `push_targets(p_lat, p_lng, p_after, p_limit)` | Server only (secret key) | For the sender (the `push-sightings` Edge Function): the live subscriptions whose cells hold a sighting's square, at most 500 per page, in id order |
 | `push_drop(p_ids)` | Server only (secret key) | For the sender: deletes subscriptions whose push service says they're gone |
 | `push_cell(p_lat, p_lng)`, `push_purge()` | Nobody through the API | The square id for a point (same as `cellOf()` in `lib/push-cells.ts`), and the daily cleanup |
 
@@ -799,13 +799,58 @@ See the table under "Server functions" above. In short: `push_create`, `push_upd
 
 Do these on your own computer and in the dashboards. The real project only: `/demo` has no push alerts, so never run the push migration on the demo project.
 
-1. **VAPID keys.** On your own computer, run `npx @pushforge/builder vapid`. It prints a public key (for the app) and a private key in JWK format (for the sender). Keep the private key out of Vercel, the repository and chats; the Edge Function steps (next handoff) say where it goes.
+1. **VAPID keys.** On your own computer, run `npx @pushforge/builder vapid`. It prints a public key (for the app) and a private key in JWK format (for the sender). Keep the private key out of Vercel, the repository and chats; step 2 of "The sender" below says where it goes.
 2. **Vercel.** In the project, open Settings → Environment Variables, and add for the **Production** environment:
    - `NEXT_PUBLIC_VAPID_PUBLIC_KEY`: the public key from step 1, type **Config** (it's built into the page, so it isn't secret).
    - `TURNSTILE_SECRET_KEY`: the secret key of the same Turnstile widget that Supabase Auth's CAPTCHA uses (Cloudflare dashboard → Turnstile → the widget → its secret key), type **Secret** (write-only after saving; Vercel used to call these "Sensitive"). Never give it a `NEXT_PUBLIC_` name.
    Then redeploy: changes apply only to new deployments.
 3. **Supabase, real project only.** SQL Editor → New query → paste `database/migrations/20261125_push_subscriptions.sql` → Run. The last statement should show `129944032`. Check again any time with `select public.push_cell(39.952, -75.164);` (expect `129944032`), and see the job with `select jobname, schedule from cron.job where jobname = 'purge-push-subscriptions';`.
-4. **Sender.** The next handoff adds the Edge Function that sends the pushes, and its steps.
+4. **Sender.** Deploy the `push-sightings` Edge Function and create its webhook: see "The sender" below.
+
+### The sender: the `push-sightings` Edge Function
+
+`supabase/functions/push-sightings/index.ts` sends the alerts. A database webhook calls it after every new pin. It checks the secret header, answers `ok` at once, and then, in the background, asks `push_targets` for the first 200 subscriptions whose squares hold the pin's square. It sends each one an encrypted push (TTL 1 hour, urgency high, no topic, 20 at a time) and deletes the ones whose push service answers 404 or 410 with `push_drop`. If the page was full, it calls itself for the next 200. A 429, a 5xx answer or a network error is retried twice, after the `Retry-After` wait (at most 10 s) or else 2 s and then 6 s. It starts no push request more than 100 s into a call, and a message that still fails is dropped, not kept. Everyone gets the same message: `{ "v": 1, "id", "lat", "lng", "cat", "at", "pad" }`, the pin's rounded point, category, time and id, padded with spaces to exactly 512 characters.
+
+It writes one log line per call, `{"event":"push-sightings","sent":n,"dropped":n,"failed":n,"next":true|false}`, and two error lines: `{"event":"push-sightings","error":"not_configured"}` (a secret is missing or malformed) and `{"event":"push-sightings","error":"unexpected"}` (anything else went wrong; it holds no detail on purpose, because errors from `fetch` contain the push endpoint). It never logs or returns an endpoint, key, coordinate, pin id or anything a push service said, and its answer is always one word: `ok`, `ignored`, `unauthorized` or `error`.
+
+Do these on your own computer, in the real project only. The Supabase CLI runs with `npx supabase …` (version 3.x was checked; `npx supabase --help` and `npx supabase functions deploy --help` list the current flags).
+
+1. **Log in and link.** `npx supabase login`, then `npx supabase link --project-ref <project-ref>` (the ref is in the project's URL and under Project Settings). Linking creates a `supabase/.temp` folder: don't commit it.
+2. **Secrets.** Set these three as Edge Function secrets, in Dashboard → Edge Functions → Secrets (best for the key: it stays out of your shell history), or with `npx supabase secrets set NAME=value`:
+
+   | Secret | Value |
+   | --- | --- |
+   | `VAPID_PRIVATE_JWK` | The private key (JSON) from "VAPID keys" in step 1 above, pasted as one line. It must be the pair of `NEXT_PUBLIC_VAPID_PUBLIC_KEY`: a phone accepts alerts only from the key it subscribed with. Never put it in the repository or Vercel |
+   | `VAPID_SUBJECT` | A contact for the push services: `mailto:name@example.org` or `https://example.org`, with no spaces or angle brackets (Apple refuses other forms). Google, Apple, Mozilla and Microsoft can see it, so use an address that isn't personal |
+   | `PUSH_WEBHOOK_SECRET` | A long random value, for example from `openssl rand -base64 32`. Keep it: the webhook needs the same value |
+
+   You don't set the project URL or the secret key: Supabase gives every function `SUPABASE_URL` and `SUPABASE_SECRET_KEYS` (a JSON list of the project's secret API keys; the function uses the one named `default`). If the function logs `not_configured`, check these three secrets first, then that the project has a secret API key. A new value applies at once, with no redeploy. To use `--env-file` instead, keep the file outside the repository and delete it afterwards.
+3. **Deploy, with JWT verification off.** From the repository root: `npx supabase functions deploy push-sightings --no-verify-jwt --use-api` (`--use-api` bundles on Supabase's side, so Docker isn't needed). Supabase otherwise refuses calls that carry no Supabase login token, and the webhook sends none: the secret header is this function's check. Pass `--no-verify-jwt` on every deploy; a deploy without it turns verification back on. The function should then appear in Dashboard → Edge Functions.
+4. **Test call.** This sends a made-up pin straight to the function and inserts nothing into `sightings`, but it does send real pushes to every phone watching that square, so use a point near a test place that only your own test phone has switched on (in the phone's alert distance, since the phone checks the exact distance itself):
+
+   ```bash
+   read -rs PUSH_WEBHOOK_SECRET   # paste the secret; it won't show or enter your history
+   curl -i -X POST "https://<project-ref>.supabase.co/functions/v1/push-sightings" \
+     -H "content-type: application/json" \
+     -H "x-icepik-webhook: $PUSH_WEBHOOK_SECRET" \
+     -d '{"type":"INSERT","table":"sightings","record":{"id":"00000000-0000-4000-8000-000000000001","lat":39.952,"lng":-75.164,"category":"other","created_at":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"}}'
+   ```
+
+   Expect `200` and the body `ok`, an alert on the test phone within seconds, and in Dashboard → Edge Functions → push-sightings → Logs one line such as `{"event":"push-sightings","sent":1,"dropped":0,"failed":0,"next":false}`. With a wrong or missing `x-icepik-webhook` header the answer is `401` and `unauthorized`, and nothing is sent. A made-up pin that is valid but matches no phone logs `"sent":0`. Try an iPhone with the app on the Home Screen first: the sender library (`@pushforge/builder` 2.0.5) uses the older `aesgcm` content encoding, which Chrome and Firefox accept, but Apple's documentation doesn't list which encodings Safari accepts.
+5. **Create the webhook, real project only** (never the demo or a scratch project: it would send pushes for their pins too). Dashboard → Database → Webhooks → Create a new hook:
+   - Name `push_sightings`; Table `public.sightings`; Events: **Insert** only.
+   - Type of webhook: **Supabase Edge Functions** and pick `push-sightings` (or **HTTP Request** with method `POST` and the URL `https://<project-ref>.supabase.co/functions/v1/push-sightings`).
+   - HTTP Headers: keep `Content-Type: application/json` and add `x-icepik-webhook` with the same value as `PUSH_WEBHOOK_SECRET`. Don't add the "auth header with service key" option: the function doesn't need it, and it would send the secret key to it. The webhook stores the header value in its trigger, visible to anyone with database access.
+   - Timeout: the default is 1000 ms. Raise it to 5000 ms: the function answers at once, but a cold start can take longer than a second, and a webhook that times out is not retried.
+
+   Then post a pin from a second phone, or run the "Test pins" SQL above (delete it afterwards), and check the function's Logs. `pg_net` keeps each answer for 6 hours in `net._http_response`; the function's are one word.
+
+What to know:
+
+- **Free plan.** A call may use 2 s of CPU and 150 s of wall time, and the plan gives 500,000 calls a month. In the local test one message cost about 2.3 to 3.7 ms of CPU, so a 200-subscriber page takes roughly 0.5 to 0.9 s. A pin costs one call plus one more for every further 200 subscribers.
+- **Long chains.** Supabase's limits page lists "recursive calls: 30 requests per trace in a 60-second window". If that applies to the function calling itself, alerts for one pin would stop after about 6,000 subscribers. Watch this if the number of subscriptions grows.
+- **No second chances.** A follow-on call that fails isn't retried (the rest of that pin's subscribers get no alert), and a push that still fails after its retries is dropped.
+- **Rotating the VAPID key** makes every saved subscription useless, since phones accept only the key they subscribed with: they have to subscribe again.
 
 ## Done when
 
@@ -834,7 +879,7 @@ Run these on two real phones (A and B) against the Supabase project before calli
 
 These are outside the MVP schema. Ask before building screens that need them.
 
-- **Push alerts: server side only so far.** The table, its functions, the cleanup job, the server actions and the renew route are built (see "Push alerts" above). The service worker and the settings screens (next handoffs) and the Edge Function that sends the pushes are not.
+- **Push alerts: server side only so far.** The table, its functions, the cleanup job, the server actions, the renew route and the sender (the `push-sightings` Edge Function) are built (see "Push alerts" above). The service worker and the settings screens (next handoffs) are not.
 - **Stretch features with no tables yet:** local news, live streaming and translated text. Only `preferred_language` is stored. Light mode needs nothing from the database.
 - **Out of scope in the PRD:** comments and followers.
 - **No moderation:** there's no "report this pin" flow. For now, admins delete harmful posts in Supabase's Table Editor. A report button needs a new table, so ask first.
