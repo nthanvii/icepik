@@ -8,6 +8,8 @@
 //   rethrow what they catch.
 // - Padding is RFC 8188's (a delimiter octet and zeros inside the record), not
 //   random, so every message encrypts to a body of the same length.
+// - No VAPID token is kept here, only the imported signing key. The private
+//   key is used only to sign: nothing this file returns holds it.
 
 const ECDH = { name: "ECDH", namedCurve: "P-256" } as const;
 const ECDSA = { name: "ECDSA", namedCurve: "P-256" } as const;
@@ -116,66 +118,110 @@ export async function encrypt(input: Encryption): Promise<Bytes> {
 
 // ---------------------------------------------------------------- VAPID (RFC 8292)
 
-const TOKEN_LIFETIME_S = 12 * 60 * 60; // RFC 8292 section 2: exp at most 24 hours ahead
-const REFRESH_MARGIN_S = 15 * 60; // only an isolate that lives this long ever signs a second token
+// index.ts keeps one token per push service in the database
+// (push_vapid_tokens), shared by every worker, and signs a new one with
+// signVapid() only when none is usable.
+
+const LIFETIME_S = 12 * 60 * 60; // a new token's exp is this far ahead
+const MIN_LEFT_S = 15 * 60; // a stored token needs this long left: push_vapid_get's rule
+const MAX_AHEAD_S = 24 * 60 * 60; // RFC 8292 section 2: exp at most 24 hours ahead
+const MAX_HEADER_CHARS = 2048; // the longest header push_vapid_tokens accepts
+
+// The JWT header segment, the same in every token.
+const JWT_HEAD = toBase64Url(text.encode(JSON.stringify({ typ: "JWT", alg: "ES256" })));
+// "vapid t=<JWT>, k=<public key>": an ES256 signature is 64 octets (86
+// characters), the public key a 65-octet point (87 characters).
+const AUTHORIZATION = /^vapid t=([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]{86}), k=([A-Za-z0-9_-]{87})$/;
+const utf8 = new TextDecoder("utf-8", { fatal: true });
+
+const ES256 = { name: "ECDSA", hash: "SHA-256" } as const;
 
 type Signer = { key: CryptoKey; publicKey: string };
-type Issued = { header: string; exp: number };
 
 const signers = new Map<string, Promise<Signer>>();
-const issued = new Map<string, Promise<Issued>>();
 
+// Imports the key once per isolate. Deno makes a private key from d alone and
+// ignores x and y, so the public key is imported on its own and has to verify
+// a signature: a JWK whose halves don't match is refused, and k= is always
+// the signing key's.
 function signerFor(jwk: JsonWebKey): Promise<Signer> {
   const { x, y, d } = jwk;
   if (typeof x !== "string" || typeof y !== "string" || typeof d !== "string") throw new Error("jwk");
-  const id = `${x}.${y}`;
+  const id = `${x}.${y}.${d}`;
   let signer = signers.get(id);
   if (!signer) {
     signer = (async () => {
-      const key = await crypto.subtle.importKey("jwk", { kty: "EC", crv: "P-256", x, y, d, ext: true }, ECDSA, false, [
-        "sign",
-      ]);
-      const point = concat(new Uint8Array([0x04]), fromBase64Url(x), fromBase64Url(y));
-      if (point.length !== 65) throw new Error("jwk");
-      return { key, publicKey: toBase64Url(point) };
+      try {
+        const publicJwk = { kty: "EC", crv: "P-256", x, y, ext: true };
+        const key = await crypto.subtle.importKey("jwk", { ...publicJwk, d }, ECDSA, false, ["sign"]);
+        const pub = await crypto.subtle.importKey("jwk", publicJwk, ECDSA, true, ["verify"]);
+        const probe = text.encode("vapid key check");
+        if (!(await crypto.subtle.verify(ES256, pub, await crypto.subtle.sign(ES256, key, probe), probe))) {
+          throw new Error("jwk");
+        }
+        const point = new Uint8Array(await crypto.subtle.exportKey("raw", pub));
+        if (point.length !== 65 || point[0] !== 0x04) throw new Error("jwk");
+        return { key, publicKey: toBase64Url(point) };
+      } catch {
+        throw new Error("jwk");
+      }
     })();
     signers.set(id, signer);
   }
   return signer;
 }
 
-async function issue(jwk: JsonWebKey, subject: string, origin: string): Promise<Issued> {
-  const signer = await signerFor(jwk);
-  const exp = Math.floor(Date.now() / 1000) + TOKEN_LIFETIME_S;
-  const header = toBase64Url(text.encode(JSON.stringify({ typ: "JWT", alg: "ES256" })));
-  const claims = toBase64Url(text.encode(JSON.stringify({ aud: origin, exp, sub: subject })));
-  // WebCrypto's ECDSA signature is the raw r || s that JWS ES256 wants.
-  const signature = new Uint8Array(
-    await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, signer.key, text.encode(`${header}.${claims}`)),
-  );
-  const token = `${header}.${claims}.${toBase64Url(signature)}`;
-  return { header: `vapid t=${token}, k=${signer.publicKey}`, exp };
+// The claims segment: aud, exp and sub, in that order, nothing else.
+function claimsPart(origin: string, exp: number, subject: string): string {
+  return toBase64Url(text.encode(JSON.stringify({ aud: origin, exp, sub: subject })));
 }
 
-// The Authorization header for one push service. One token is made for each
-// origin (https://fcm.googleapis.com, https://web.push.apple.com, ...) and kept
-// for the life of the isolate, since Apple asks senders not to refresh a token
-// more than once an hour. Callers at the same moment share one signing.
-export async function vapidAuthorization(jwk: JsonWebKey, subject: string, origin: string): Promise<string> {
-  const id = `${origin} ${subject} ${jwk.x}.${jwk.y}`;
-  for (let round = 0; round < 2; round++) {
-    let entry = issued.get(id);
-    if (!entry) {
-      entry = issue(jwk, subject, origin);
-      issued.set(id, entry);
-    }
-    try {
-      const token = await entry;
-      if (token.exp - Math.floor(Date.now() / 1000) > REFRESH_MARGIN_S) return token.header;
-    } catch {
-      // Drop it below and try once more.
-    }
-    if (issued.get(id) === entry) issued.delete(id);
+// The VAPID public key: base64url of its uncompressed P-256 point (65 octets,
+// 87 characters). It is the k= of every header and part of the key a token is
+// stored under. Rejects with a fixed word when the JWK can't sign.
+export async function vapidPublicKey(jwk: JsonWebKey): Promise<string> {
+  return (await signerFor(jwk)).publicKey;
+}
+
+// A new token for one push service. origin is the push service's origin
+// (https://fcm.googleapis.com, https://web.push.apple.com, ...). Returns the
+// whole Authorization value and the token's exp in seconds since 1970.
+// Rejects when the JWK can't sign.
+export async function signVapid(
+  jwk: JsonWebKey,
+  subject: string,
+  origin: string,
+): Promise<{ header: string; expiresAt: number }> {
+  const signer = await signerFor(jwk);
+  const exp = Math.floor(Date.now() / 1000) + LIFETIME_S;
+  const unsigned = `${JWT_HEAD}.${claimsPart(origin, exp, subject)}`;
+  // WebCrypto's ECDSA signature is the raw r || s that JWS ES256 wants.
+  const signature = new Uint8Array(await crypto.subtle.sign(ES256, signer.key, text.encode(unsigned)));
+  return { header: `vapid t=${unsigned}.${toBase64Url(signature)}, k=${signer.publicKey}`, expiresAt: exp };
+}
+
+// Whether a stored header can be sent to this origin now: exactly the shape
+// signVapid() makes, with this public key, aud and sub, and an exp at least
+// 15 minutes and at most 24 hours after nowSeconds. The database already
+// filters; this checks again. Never throws. The signature is not verified.
+export function vapidHeaderUsable(
+  header: unknown,
+  origin: string,
+  subject: string,
+  publicKey: string,
+  nowSeconds: number,
+): header is string {
+  try {
+    if (typeof header !== "string" || header.length > MAX_HEADER_CHARS) return false;
+    const match = AUTHORIZATION.exec(header);
+    if (!match || match[1] !== JWT_HEAD || match[4] !== publicKey) return false;
+    const claims: unknown = JSON.parse(utf8.decode(fromBase64Url(match[2])));
+    const exp = typeof claims === "object" && claims !== null ? (claims as { exp?: unknown }).exp : undefined;
+    if (typeof exp !== "number" || !Number.isSafeInteger(exp)) return false;
+    if (match[2] !== claimsPart(origin, exp, subject)) return false;
+    const left = exp - nowSeconds;
+    return left >= MIN_LEFT_S && left <= MAX_AHEAD_S;
+  } catch {
+    return false;
   }
-  throw new Error("vapid");
 }

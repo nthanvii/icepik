@@ -1,7 +1,10 @@
 // Coarse alert squares. Must match public.push_cell() in database/icepik_schema.sql.
 // Integer maths in thousandths of a degree, so the phone and Postgres agree on
 // points that sit exactly on a square's edge (sightings are rounded to 0.001°).
-export const ALERT_DISTANCES_MI = [0.25, 0.5, 1, 2, 5] as const;
+// Alert distances, in miles. Every push is shown, and 0.25 or 0.5 miles would
+// send the same alerts as 1 mile anywhere south of 55°N, so they aren't offered.
+export const ALERT_DISTANCES_MI = [1, 2, 5] as const;
+export const DEFAULT_ALERT_DISTANCE_MI: (typeof ALERT_DISTANCES_MI)[number] = 1;
 export const MAX_ALERT_PLACES = 5;
 export const MAX_ALERT_CELLS = 1000;
 const LAT_STEP = 20; // 0.020°

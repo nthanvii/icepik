@@ -6,6 +6,13 @@
 //   2. This function calling itself for the next page of subscriptions:
 //      { next: { sighting, after } }.
 //
+// VAPID tokens are shared through the database, one per push service, because
+// a worker lives at most 150 s and Apple asks senders not to make a new token
+// more than once an hour. A call reads the stored token once per push service
+// (push_vapid_get), and signs and stores a new one (push_vapid_put) only when
+// none is usable. If the read or the write fails, the call signs its own token
+// and sends anyway: an alert matters more than the hourly guidance.
+//
 // Rules for this file:
 // - Log only the fixed lines in logSummary() and logError(). Never log an
 //   endpoint, key, coordinate, id, error object or error message: Deno's fetch
@@ -18,7 +25,7 @@
 // - JWT verification is off for this function (see docs/database-handoff.md);
 //   the secret header is its only check.
 
-import { encrypt, fromBase64Url, vapidAuthorization } from "./webpush.ts";
+import { encrypt, fromBase64Url, signVapid, vapidHeaderUsable, vapidPublicKey } from "./webpush.ts";
 
 const NAME = "push-sightings";
 const SECRET_HEADER = "x-icepik-webhook";
@@ -42,6 +49,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const ENDPOINT =
   /^https:\/\/(fcm\.googleapis\.com|jmt17\.google\.com|web\.push\.apple\.com|updates\.push\.services\.mozilla\.com|[a-z0-9-]+\.notify\.windows\.com)\/[\x21-\x7e]*$/;
 const MAX_ENDPOINT_LENGTH = 1024;
+const MAX_SUBJECT_CHARS = 512; // push_vapid_tokens.subject's limit
 
 // Exists only on Supabase's runtime.
 declare const EdgeRuntime: { waitUntil(promise: Promise<unknown>): void } | undefined;
@@ -60,6 +68,8 @@ type Sighting = { id: string; lat: number; lng: number; category: string; at: st
 type Job = { sighting: Sighting; after: string | null };
 type Target = { id: string; endpoint: string; p256dh: string; auth: string };
 type Outcome = "sent" | "gone" | "failed";
+// One call's VAPID headers by push-service origin, and its token writes.
+type Tokens = { headers: Map<string, Promise<string>>; writes: Promise<unknown>[] };
 
 // ---------------------------------------------------------------- logging
 
@@ -139,8 +149,11 @@ function readConfig(): Config | null {
     const secret = Deno.env.get("PUSH_WEBHOOK_SECRET");
     if (!url || !secretKeys || !jwkText || !subject || !secret) return null;
 
-    // Apple refuses a VAPID subject that isn't a mailto: or https: URL.
-    if (!/^(mailto:[^\s<>]+|https:\/\/[^\s<>]+)$/.test(subject)) return null;
+    // Apple refuses a VAPID subject that isn't a mailto: or https: URL. Only
+    // printable ASCII (a URL's own characters) and at most 512 characters, so
+    // push_vapid_tokens can store the subject and the tokens that name it.
+    if (subject.length > MAX_SUBJECT_CHARS || !/^(mailto:|https:\/\/)[\x21-\x7e]+$/.test(subject)) return null;
+    if (/[<>]/.test(subject)) return null;
 
     const keys = JSON.parse(secretKeys);
     const key = isRecord(keys)
@@ -230,6 +243,7 @@ function round3(value: number): number {
 
 // Never rejects: anything unexpected becomes the one error line.
 async function runJob(config: Config, job: Job, startedAt: number): Promise<void> {
+  const tokens: Tokens = { headers: new Map(), writes: [] };
   try {
     const plaintext = buildPayload(job.sighting);
 
@@ -261,7 +275,7 @@ async function runJob(config: Config, job: Job, startedAt: number): Promise<void
     let sent = 0;
     const gone: string[] = [];
     await inParallel(usable, IN_FLIGHT, async (target) => {
-      const outcome = await deliver(config, plaintext, target, startedAt);
+      const outcome = await deliver(config, tokens, plaintext, target, startedAt);
       if (outcome === "sent") sent++;
       else if (outcome === "gone") gone.push(target.id);
       else failed++;
@@ -274,8 +288,12 @@ async function runJob(config: Config, job: Job, startedAt: number): Promise<void
       else failed += gone.length;
     }
 
+    // The call lasts until its token writes have finished. They never delay
+    // a push, and their outcome is not logged.
+    await Promise.allSettled(tokens.writes);
     logSummary(sent, dropped, failed, full);
   } catch {
+    await Promise.allSettled(tokens.writes);
     logError("unexpected");
   }
 }
@@ -311,10 +329,14 @@ async function fetchTargets(config: Config, job: Job): Promise<unknown[] | null>
   return result.ok && Array.isArray(result.data) ? result.data : null;
 }
 
-// Starts this function again for the page after `after`. A failed call is
-// tried once more, after the Retry-After wait on a 429 (at most 10 s), or the
-// retryAfterMs that Supabase's runtime puts on the error it throws when
-// function-to-function calls go over its limit, or else 2 s.
+// Starts this function again for the page after `after`. The call is tried
+// once more only when it never ran: after a 429 (wait for Retry-After, at most
+// 10 s, else 2 s), or when fetch throws the error Supabase's runtime throws
+// when function-to-function calls go over its limit (wait its retryAfterMs,
+// at most 10 s, else 2 s). Any other failure is not retried: a call that had
+// started would send its page twice, and iPhones show a repeat as a second
+// notification (WebKit bug 258922). No retry starts 100 s or more into this
+// call.
 function startNext(config: Config, sighting: Sighting, after: string, startedAt: number) {
   const body = JSON.stringify({
     next: {
@@ -329,37 +351,72 @@ function startNext(config: Config, sighting: Sighting, after: string, startedAt:
     },
   });
   background((async () => {
-    for (let attempt = 0; attempt < 2; attempt++) {
-      let wait = retryDelayMs(null, 0);
-      try {
-        const res = await fetch(`${config.url}/functions/v1/${NAME}`, {
-          method: "POST",
-          headers: { "content-type": "application/json", [SECRET_HEADER]: config.secret },
-          body,
-          signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-        });
-        const status = res.status;
-        const retryAfter = res.headers.get("retry-after");
-        await res.body?.cancel().catch(() => {});
-        if (status >= 200 && status < 300) return;
-        if (status === 429) wait = retryDelayMs(retryAfter, 0);
-      } catch (error) {
-        // Never logged: the message holds the URL. Only the wait is read from it.
-        const ms = (error as { retryAfterMs?: unknown } | null)?.retryAfterMs;
-        if (typeof ms === "number" && Number.isFinite(ms)) wait = Math.min(Math.max(ms, 0), MAX_RETRY_WAIT_MS);
-      }
-      if (attempt === 1 || Date.now() - startedAt >= GIVE_UP_MS) return;
-      await sleep(wait);
-    }
+    const wait = await callNext(config, body);
+    if (wait === null || Date.now() - startedAt >= GIVE_UP_MS) return;
+    await sleep(wait);
+    if (Date.now() - startedAt >= GIVE_UP_MS) return;
+    await callNext(config, body);
   })());
+}
+
+// Makes the follow-on call once. Never throws. Returns the wait before the one
+// more try when the call never ran, or null: done, or it may have run.
+async function callNext(config: Config, body: string): Promise<number | null> {
+  try {
+    const res = await fetch(`${config.url}/functions/v1/${NAME}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", [SECRET_HEADER]: config.secret },
+      body,
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+    const status = res.status;
+    const retryAfter = res.headers.get("retry-after");
+    await res.body?.cancel().catch(() => {});
+    // A 429 is refused before the function runs. Any other answer, a 5xx
+    // too, may come after the call had started.
+    return status === 429 ? retryDelayMs(retryAfter, 0) : null;
+  } catch (error) {
+    // Never logged: the message holds the URL. Only the wait is read from it.
+    // A network error or a timeout may come after the call had started.
+    return rateLimitWaitMs(error);
+  }
+}
+
+// The wait on Supabase's rate-limit error, or null for any other error. The
+// runtime throws Deno.errors.RateLimitError, whose retryAfterMs is null when
+// it can't tell when the limit resets: then wait 2 s. Otherwise wait the
+// finite retryAfterMs, at most 10 s. Never throws.
+function rateLimitWaitMs(error: unknown): number | null {
+  try {
+    const ms = (error as { retryAfterMs?: unknown } | null | undefined)?.retryAfterMs;
+    if (typeof ms === "number" && Number.isFinite(ms)) return Math.min(Math.max(ms, 0), MAX_RETRY_WAIT_MS);
+    const RateLimitError = (Deno.errors as unknown as Record<string, unknown>).RateLimitError;
+    if (typeof RateLimitError === "function" && error instanceof (RateLimitError as new () => Error)) {
+      return RETRY_WAITS_MS[0];
+    }
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------- sending
 
 // Never throws.
-async function deliver(config: Config, plaintext: Uint8Array<ArrayBuffer>, target: Target, startedAt: number): Promise<Outcome> {
+async function deliver(
+  config: Config,
+  tokens: Tokens,
+  plaintext: Uint8Array<ArrayBuffer>,
+  target: Target,
+  startedAt: number,
+): Promise<Outcome> {
   // Only the push services the table allows. A mismatch is counted as failed.
+  // This comes first, so only an allowed push service's origin ever reaches
+  // the token table.
   if (target.endpoint.length > MAX_ENDPOINT_LENGTH || !ENDPOINT.test(target.endpoint)) return "failed";
+  // Past the give-up time this push can't be sent, so don't read, sign or
+  // store a token for it either.
+  if (Date.now() - startedAt >= GIVE_UP_MS) return "failed";
 
   let headers: Record<string, string>;
   let body: Uint8Array<ArrayBuffer>;
@@ -371,14 +428,14 @@ async function deliver(config: Config, plaintext: Uint8Array<ArrayBuffer>, targe
       paddedBytes: PADDED_BYTES,
     });
     headers = {
-      Authorization: await vapidAuthorization(config.jwk, config.subject, new URL(target.endpoint).origin),
+      Authorization: await authorization(config, tokens, new URL(target.endpoint).origin),
       "Content-Encoding": "aes128gcm",
       "Content-Type": "application/octet-stream",
       TTL: String(TTL_SECONDS),
       Urgency: "high", // no Topic
     };
   } catch {
-    return "failed"; // bad keys: retrying won't help
+    return "failed"; // bad keys (the subscription's or the VAPID key): retrying won't help
   }
 
   for (let attempt = 0;; attempt++) {
@@ -439,13 +496,52 @@ async function inParallel<T>(items: T[], limit: number, work: (item: T) => Promi
   await Promise.all(Array.from({ length: Math.min(limit, items.length) }, lane));
 }
 
+// ---------------------------------------------------------------- VAPID tokens
+
+// The Authorization header for one push-service origin in this call. The first
+// push to an origin starts the work; every other push to it, even with 20 in
+// flight, awaits the same promise, so a call reads at most once and signs at
+// most once per origin.
+function authorization(config: Config, tokens: Tokens, origin: string): Promise<string> {
+  let header = tokens.headers.get(origin);
+  if (!header) {
+    header = vapidHeader(config, tokens, origin);
+    tokens.headers.set(origin, header);
+  }
+  return header;
+}
+
+// The stored token when one is usable; otherwise a new one, stored without
+// waiting (two workers at the same moment may each sign one; the last write
+// stays). A failed read or write just means this call signs its own. Rejects
+// only when the VAPID key can't sign: every push to this origin then fails.
+// There is no give-up check here: work that began before the give-up time may
+// end after it, and a token signed then is still stored for later calls.
+async function vapidHeader(config: Config, tokens: Tokens, origin: string): Promise<string> {
+  const publicKey = await vapidPublicKey(config.jwk);
+  const lookup = { p_origin: origin, p_public_key: publicKey, p_subject: config.subject };
+  const stored = await rpc(config, "push_vapid_get", lookup);
+  if (stored.ok && vapidHeaderUsable(stored.data, origin, config.subject, publicKey, Date.now() / 1000)) {
+    return stored.data;
+  }
+  const fresh = await signVapid(config.jwk, config.subject, origin);
+  tokens.writes.push(rpc(config, "push_vapid_put", {
+    ...lookup,
+    p_header: fresh.header,
+    p_expires_at: new Date(fresh.expiresAt * 1000).toISOString(),
+  }));
+  return fresh.header;
+}
+
 // ---------------------------------------------------------------- PostgREST
 
 // Calls a database function over HTTP with the secret key. The new secret keys
-// aren't JWTs, so they go in `apikey`, not `Authorization: Bearer`.
+// aren't JWTs, so they go in `apikey`, not `Authorization: Bearer`. Never
+// throws. data is the parsed JSON answer: for push_vapid_get a string or null,
+// for push_drop and push_vapid_put null (an empty 204, or 200 with null).
 async function rpc(
   config: Config,
-  fn: "push_targets" | "push_drop",
+  fn: "push_targets" | "push_drop" | "push_vapid_get" | "push_vapid_put",
   args: Record<string, unknown>,
 ): Promise<{ ok: true; data: unknown } | { ok: false }> {
   try {

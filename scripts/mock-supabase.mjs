@@ -36,9 +36,19 @@
 // push_delete, in memory, with the SQL's results and errors (push_invalid,
 // push_endpoint_taken, a table check's 23514). Only the device secret's
 // SHA-256 is kept.
+// The alert sender's shared VAPID tokens (push_vapid_tokens), in memory, as
+// the same file: push_vapid_put stores or replaces the token of a push
+// service's origin (push_invalid for an expiry that is missing, past or more
+// than 24 hours ahead; a table check's 23514 for a bad origin, public key,
+// subject or header), and push_vapid_get returns it only for the same
+// public key and subject with at least 15 minutes left, else null. Both take
+// the secret key in apikey, with no Authorization header (as the Edge
+// Function sends it) or with "Bearer <secret key>" (as supabase-js does);
+// any other caller gets permission denied.
 // GET /__mock/requests lists the requests this project received (method,
-// path, and whether they used the secret key: never a body or a header), so
-// a check can prove the demo's reset never reached the real project.
+// path, and whether they used the secret key in both apikey and
+// Authorization: never a body or a header), so a check can prove the demo's
+// reset never reached the real project.
 // POST /__mock/requests clears that list.
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import http from "node:http";
@@ -385,6 +395,75 @@ async function push(req, url) {
   return [200, true];
 }
 
+// The alert sender's VAPID tokens (push_vapid_tokens in
+// database/icepik_schema.sql), by push service origin.
+const vapidRows = new Map();
+const PUSH_ORIGIN =
+  /^https:\/\/(fcm\.googleapis\.com|jmt17\.google\.com|web\.push\.apple\.com|updates\.push\.services\.mozilla\.com|[a-z0-9-]+\.notify\.windows\.com)$/;
+const VAPID_HEADER = /^vapid t=[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+, k=[A-Za-z0-9_-]{87}$/;
+const MINUTE = 60000;
+// The secret key in apikey, with no Authorization header (the Edge
+// Function's way) or with the same key as a Bearer token (supabase-js's way).
+const isSecretKey = (req) =>
+  req.headers.apikey === SECRET_KEY &&
+  (req.headers.authorization === undefined || req.headers.authorization === `Bearer ${SECRET_KEY}`);
+// The table's checks.
+const vapidRowOk = (r) =>
+  PUSH_ORIGIN.test(r.origin) &&
+  /^[A-Za-z0-9_-]{87}$/.test(r.publicKey) &&
+  Array.from(r.subject).length <= 512 &&
+  /^(mailto:|https:\/\/)[^\s<>]+$/.test(r.subject) &&
+  r.header.length <= 2048 &&
+  VAPID_HEADER.test(r.header) &&
+  r.header.slice(-87) === r.publicKey;
+
+async function vapid(req, url) {
+  const rpc = url.pathname.match(/^\/rest\/v1\/rpc\/(push_vapid_get|push_vapid_put)$/);
+  if (!rpc || req.method !== "POST") return null;
+  const input = (await readBody(req)) ?? {};
+  if (!isSecretKey(req)) return dbError(`permission denied for function ${rpc[1]}`, "42501");
+
+  if (rpc[1] === "push_vapid_get") {
+    const row = vapidRows.get(input.p_origin);
+    const usable =
+      row !== undefined &&
+      row.publicKey === input.p_public_key &&
+      row.subject === input.p_subject &&
+      row.expiresAt >= Date.now() + 15 * MINUTE;
+    // PostgREST answers a function's text as JSON, and SQL null as null.
+    return usable ? [200, row.header] : [200, null, "null"];
+  }
+
+  // push_vapid_put
+  const at = input.p_expires_at ?? null;
+  if (at !== null && (typeof at !== "string" || Number.isNaN(Date.parse(at)))) {
+    return dbError("invalid input syntax for type timestamp with time zone", "22007");
+  }
+  const expiresAt = at === null ? null : Date.parse(at);
+  if (expiresAt === null || expiresAt <= Date.now() || expiresAt > Date.now() + 24 * 60 * MINUTE) {
+    return dbError("push_invalid");
+  }
+  const row = {
+    origin: input.p_origin ?? null,
+    publicKey: input.p_public_key ?? null,
+    subject: input.p_subject ?? null,
+    header: input.p_header ?? null,
+    expiresAt,
+  };
+  const column = { origin: "origin", publicKey: "public_key", subject: "subject", header: "header" };
+  const missing = Object.keys(column).find((k) => row[k] === null);
+  if (missing) {
+    const message = `null value in column "${column[missing]}" of relation "push_vapid_tokens" violates not-null constraint`;
+    return dbError(message, "23502");
+  }
+  if (Object.keys(column).some((k) => typeof row[k] !== "string") || !vapidRowOk(row)) {
+    return dbError('new row for relation "push_vapid_tokens" violates check constraint', "23514");
+  }
+  // on conflict (origin) do update: the last writer wins.
+  vapidRows.set(row.origin, row);
+  return [204, null];
+}
+
 http
   .createServer(async (req, res) => {
     const h = {
@@ -409,11 +488,11 @@ http
     }
     requests.push({ method: req.method, path: url.pathname, secretKey: isAdmin(req) });
     if (requests.length > 5000) requests.shift();
-    const answer = (await accounts(req, url)) ?? (await push(req, url));
+    const answer = (await accounts(req, url)) ?? (await push(req, url)) ?? (await vapid(req, url));
     if (answer) {
-      const [code, json] = answer;
+      const [code, json, raw] = answer;
       res.writeHead(code, h);
-      return res.end(json === null ? "" : JSON.stringify(json));
+      return res.end(raw ?? (json === null ? "" : JSON.stringify(json)));
     }
     if (url.pathname === "/rest/v1/sightings" && req.method === "GET") {
       clock = Date.now();

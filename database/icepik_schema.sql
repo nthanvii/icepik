@@ -64,6 +64,7 @@
 --   sighting_reporters  private link between a sighting and the user who posted it
 --   recovery_keys       a hash of each saved account's recovery key
 --   push_subscriptions  push endpoints for alerts, by coarse square only
+--   push_vapid_tokens   the alert sender's signed token for each push service
 --
 -- Privacy model (PRD Part 5):
 --   * Nothing anyone else can read links a person to a place. Active
@@ -806,14 +807,16 @@ select cron.schedule('purge-expired-links', '0 * * * *', 'select public.purge_ex
 -- 2.2 km x 2.2 km at 40°N. For each place the phone sends every square within
 -- its alert distance of the square that holds the place. That list depends
 -- only on which square the place is in, so this table can't place anyone
--- more precisely than one square. The phone checks the exact distance itself
--- and writes the alert text.
+-- more precisely than one square. Every push is shown, with its real
+-- distance from the nearest watched place, because browsers require a
+-- visible notification for each push; the phone still writes the alert text.
 -- No row holds a user id or a time of day, and a row expires 30 days after
 -- the app was last opened. Only the server (secret key) can call these
 -- functions: app/actions/push.ts checks a Turnstile token before
 -- push_create, and the device secret (kept here only as its SHA-256) guards
 -- push_update and push_delete. The sender (a Supabase Edge Function) uses
--- push_targets and push_drop.
+-- push_targets and push_drop, and push_vapid_get and push_vapid_put for its
+-- signed token (below).
 
 -- Square id for a point. Must match cellOf() in lib/push-cells.ts.
 create function public.push_cell(p_lat double precision, p_lng double precision)
@@ -971,7 +974,77 @@ as $$
   delete from public.push_subscriptions where id = any(p_ids);
 $$;
 
--- Daily cleanup: subscriptions not renewed for 30 days.
+-- One signed VAPID token per push service, shared by every run of the
+-- sender. A function worker on Supabase's Free plan lives at most 150 s, so
+-- a token kept only in a worker's memory would be signed again for nearly
+-- every pin, and Apple asks senders not to refresh it more than once an
+-- hour. So the sender reads the token for a push service's origin with
+-- push_vapid_get, and only when none is usable signs a new one and stores it
+-- with push_vapid_put. A row holds the whole Authorization value
+-- ("vapid t=<token>, k=<public key>"), never the private key. Keeping the
+-- token here is acceptable: it expires within 12 hours (the sender signs it
+-- for 12, and push_vapid_put refuses an expiry more than 24 hours ahead),
+-- and it is useless without push endpoints, which only the secret key can
+-- read. The origin is on the same allowlist as push_subscriptions.endpoint,
+-- with no path and no port.
+create table public.push_vapid_tokens (
+  origin      text primary key check (origin ~
+                '^https://(fcm\.googleapis\.com|jmt17\.google\.com|web\.push\.apple\.com|updates\.push\.services\.mozilla\.com|[a-z0-9-]+\.notify\.windows\.com)$'),
+  public_key  text not null check (public_key ~ '^[A-Za-z0-9_-]{87}$'),
+  subject     text not null check (char_length(subject) <= 512 and subject ~ '^(mailto:|https://)[^[:space:]<>]+$'),
+  header      text not null check (char_length(header) <= 2048
+                and header ~ '^vapid t=[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+, k=[A-Za-z0-9_-]{87}$'
+                and right(header, 87) = public_key),
+  expires_at  timestamptz not null   -- the token's exp
+);
+alter table public.push_vapid_tokens enable row level security;   -- and no policies
+revoke all on public.push_vapid_tokens from anon, authenticated;
+
+-- For the sender: the stored Authorization value for a push service, or
+-- null when no row has this origin, public key and subject with at least
+-- 15 minutes left. Matching the key and subject means a rotated VAPID key
+-- or a new subject never reuses an old token.
+create function public.push_vapid_get(p_origin text, p_public_key text, p_subject text)
+returns text
+language sql
+stable
+security definer set search_path = ''
+as $$
+  select t.header
+  from public.push_vapid_tokens t
+  where t.origin = p_origin
+    and t.public_key = p_public_key
+    and t.subject = p_subject
+    and t.expires_at >= now() + interval '15 minutes';
+$$;
+
+-- For the sender: store a newly signed Authorization value for a push
+-- service, replacing the one before it (the last writer wins). Refuses
+-- ('push_invalid') an expiry that is missing, past, or more than 24 hours
+-- ahead (RFC 8292's limit); the table's checks refuse a bad origin, key,
+-- subject or header.
+create function public.push_vapid_put(p_origin text, p_public_key text, p_subject text, p_header text, p_expires_at timestamptz)
+returns void
+language plpgsql
+volatile
+security definer set search_path = ''
+as $$
+begin
+  if p_expires_at is null or p_expires_at <= now() or p_expires_at > now() + interval '24 hours' then
+    raise exception 'push_invalid';
+  end if;
+
+  insert into public.push_vapid_tokens (origin, public_key, subject, header, expires_at)
+  values (p_origin, p_public_key, p_subject, p_header, p_expires_at)
+  on conflict (origin) do update
+  set public_key = excluded.public_key,
+      subject    = excluded.subject,
+      header     = excluded.header,
+      expires_at = excluded.expires_at;
+end;
+$$;
+
+-- Daily cleanup: subscriptions not renewed for 30 days, and expired tokens.
 create function public.push_purge()
 returns void
 language sql
@@ -979,6 +1052,7 @@ volatile
 security definer set search_path = ''
 as $$
   delete from public.push_subscriptions where expires_on < current_date;
+  delete from public.push_vapid_tokens where expires_at < now();
 $$;
 
 -- Postgres grants EXECUTE to PUBLIC by default, so revoke first.
@@ -989,12 +1063,16 @@ revoke execute on function public.push_update(uuid, text, bigint[], text, text, 
 revoke execute on function public.push_delete(uuid, text) from public, anon, authenticated;
 revoke execute on function public.push_targets(double precision, double precision, uuid, int) from public, anon, authenticated;
 revoke execute on function public.push_drop(uuid[]) from public, anon, authenticated;
+revoke execute on function public.push_vapid_get(text, text, text) from public, anon, authenticated;
+revoke execute on function public.push_vapid_put(text, text, text, text, timestamptz) from public, anon, authenticated;
 revoke execute on function public.push_purge() from public, anon, authenticated;
 grant execute on function public.push_create(text, text, text, bigint[], text) to service_role;
 grant execute on function public.push_update(uuid, text, bigint[], text, text, text) to service_role;
 grant execute on function public.push_delete(uuid, text) to service_role;
 grant execute on function public.push_targets(double precision, double precision, uuid, int) to service_role;
 grant execute on function public.push_drop(uuid[]) to service_role;
+grant execute on function public.push_vapid_get(text, text, text) to service_role;
+grant execute on function public.push_vapid_put(text, text, text, text, timestamptz) to service_role;
 
 -- Every day at 04:17 UTC, after pg_cron is set up above.
 select cron.schedule('purge-push-subscriptions', '17 4 * * *', 'select public.push_purge()');
@@ -1079,6 +1157,6 @@ alter publication supabase_realtime add table public.sightings;
 -- database/migrations/20261116_recovery_keys.sql instead.
 -- =====================================================================
 
--- drop table if exists public.push_subscriptions, public.recovery_keys, public.sighting_votes, public.sighting_reporters, public.sightings, public.profiles cascade;
--- drop function if exists public.handle_new_user, public.prepare_new_sighting, public.record_sighting_reporter, public.refresh_sighting_votes, public.sightings_near, public.distance_m, public.vote_on_sighting, public.delete_my_account, public.delete_my_sighting, public.set_my_language, public.block_auth_emails, public.signed_in_with_password_recently, public.create_recovery_key, public.has_recovery_key, public.replace_recovery_key, public.check_recovery_key, public.check_login_id, public.purge_expired_links, public.can_vote_on, public.push_cell, public.push_clean_cells, public.push_create, public.push_update, public.push_delete, public.push_targets, public.push_drop, public.push_purge cascade;
+-- drop table if exists public.push_vapid_tokens, public.push_subscriptions, public.recovery_keys, public.sighting_votes, public.sighting_reporters, public.sightings, public.profiles cascade;
+-- drop function if exists public.handle_new_user, public.prepare_new_sighting, public.record_sighting_reporter, public.refresh_sighting_votes, public.sightings_near, public.distance_m, public.vote_on_sighting, public.delete_my_account, public.delete_my_sighting, public.set_my_language, public.block_auth_emails, public.signed_in_with_password_recently, public.create_recovery_key, public.has_recovery_key, public.replace_recovery_key, public.check_recovery_key, public.check_login_id, public.purge_expired_links, public.can_vote_on, public.push_cell, public.push_clean_cells, public.push_create, public.push_update, public.push_delete, public.push_targets, public.push_drop, public.push_vapid_get, public.push_vapid_put, public.push_purge cascade;
 -- drop type if exists public.sighting_category, public.vote_type cascade;

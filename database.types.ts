@@ -218,6 +218,11 @@ export type Database = {
         };
         Returns: boolean;
       };
+      push_vapid_get: { Args: { p_origin: string; p_public_key: string; p_subject: string }; Returns: string };
+      push_vapid_put: {
+        Args: { p_expires_at: string; p_header: string; p_origin: string; p_public_key: string; p_subject: string };
+        Returns: undefined;
+      };
       replace_recovery_key: { Args: { p_user_id: string }; Returns: string };
       set_my_language: { Args: { new_language: string }; Returns: undefined };
       signed_in_with_password_recently: { Args: Record<PropertyKey, never>; Returns: boolean };
