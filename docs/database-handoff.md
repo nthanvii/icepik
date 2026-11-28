@@ -1033,7 +1033,7 @@ Run these on two real phones (A and B) against the Supabase project before calli
 
 These are outside the MVP schema. Ask before building screens that need them.
 
-- **Push alerts: built, not yet tried on real phones.** The tables, functions, cleanup job, server actions, renew route and sender (see "Push alerts" above), and the phone side ("In the app": service worker, Settings → Alerts, subscribe flow, upkeep, policy text) are built and checked against stand-ins. The policy's `POLICY_VERSION` is a draft. The owner approved the policy wording on 28 November 2026; `POLICY_VERSION` stays marked draft until the owner says to mark it final. Still to do: the owner's device check on a preview deployment (iPhone Home Screen app and Android).
+- **Push alerts: built, not yet tried on real phones.** The tables, functions, cleanup job, server actions, renew route and sender (see "Push alerts" above), and the phone side ("In the app": service worker, Settings → Alerts, subscribe flow, upkeep, policy text) are built and checked against stand-ins. The owner approved the policy wording and the in-app warning text on 28 November 2026, and `POLICY_VERSION` is `2026-11-28`, no longer marked draft. Still to do: the owner's device check on a preview deployment (iPhone Home Screen app and Android).
 - **Stretch features with no tables yet:** local news, live streaming and translated text. Only `preferred_language` is stored. Light mode needs nothing from the database.
 - **Out of scope in the PRD:** comments and followers.
 - **No moderation:** there's no "report this pin" flow. For now, admins delete harmful posts in Supabase's Table Editor. A report button needs a new table, so ask first.

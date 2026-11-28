@@ -1,9 +1,9 @@
 // Change the version whenever the text below changes: everyone is asked to
 // agree again. The accepted version is kept in localStorage only.
-export const POLICY_VERSION = "2026-11-28-draft";
+export const POLICY_VERSION = "2026-11-28";
 
 // Plain-language terms and privacy notice, shown before anything else loads.
-// DRAFT: the team must review this text before launch.
+// The owner approved this text on 28 November 2026.
 export function PolicyText() {
   return (
     <div className="policy">
