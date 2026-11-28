@@ -140,11 +140,13 @@ export const ALERT_STRINGS = {
   entryOff: { text: "Alerts are off.", note: "Settings main screen: status line under the Alerts entry. One line." },
   entryButton: { text: "Alerts", note: "Button on the Settings main screen that opens the Alerts screen. One word." },
   back: { text: "Back", note: "Button that leaves the Alerts screen." },
-  distanceLegend: { text: "Alert distance", note: "Legend of the distance radio group. Short." },
-  distanceOption: { text: "{n} mi", note: "One option of the distance group: 1, 2 or 5. Short." },
+  distanceLegend: { text: "Alert distance", note: "Label of the distance slider, shown with its current value. Short." },
+  distanceOption: { text: "{n} mi", note: "The slider's visible value and its three stop labels: 1, 2 or 5. Short." },
+  distanceValueTextOne: { text: "1 mile", note: "Spoken value of the distance slider at 1 mile (aria-valuetext). Not shown." },
+  distanceValueText: { text: "{n} miles", note: "Spoken value of the distance slider at 2 or 5 miles (aria-valuetext). Not shown." },
   distanceNote: {
     text: "Some alerts may come from a little farther away than the distance you choose.",
-    note: "Under the distance group. Two lines.",
+    note: "Under the distance slider. Two lines.",
   },
   nearMeLabel: { text: "Show sightings near me while ICEPik is open", note: "Label of the in-app notice switch. Up to two lines." },
   nearMeHint: {

@@ -168,24 +168,35 @@ export function AlertsSettings({
             )}
           </p>
         ) : null}
-        <fieldset className="choice-group">
-          <legend>{alertText("distanceLegend")}</legend>
-          <div className="choices">
+        {/* A slider with three stops: its position is the index in
+            ALERT_DISTANCES_MI (1, 2, 5), so the steps are equal. */}
+        <div className="choice-group">
+          <label htmlFor="alert-distance">
+            {alertText("distanceLegend")}: <strong>{alertText("distanceOption", { n: settings.distanceMiles })}</strong>
+          </label>
+          <input
+            id="alert-distance"
+            type="range"
+            min={0}
+            max={ALERT_DISTANCES_MI.length - 1}
+            step={1}
+            value={Math.max(0, ALERT_DISTANCES_MI.indexOf(settings.distanceMiles))}
+            aria-valuetext={alertText(settings.distanceMiles === 1 ? "distanceValueTextOne" : "distanceValueText", {
+              n: settings.distanceMiles,
+            })}
+            aria-describedby="alert-distance-note"
+            onChange={(event) => void change({ distanceMiles: ALERT_DISTANCES_MI[Number(event.target.value)] })}
+            style={{ width: "100%", minHeight: "2.75rem", accentColor: "var(--blue-strong)" }}
+          />
+          <div className="switch-row" style={{ minHeight: 0 }} aria-hidden="true">
             {ALERT_DISTANCES_MI.map((miles) => (
-              <label key={miles} className="choice">
-                <input
-                  type="radio"
-                  name="alert-distance"
-                  value={miles}
-                  checked={settings.distanceMiles === miles}
-                  onChange={() => void change({ distanceMiles: miles })}
-                />
-                <span className="choice-label">{alertText("distanceOption", { n: miles })}</span>
-              </label>
+              <span key={miles}>{alertText("distanceOption", { n: miles })}</span>
             ))}
           </div>
-        </fieldset>
-        <p className="detail-hint">{alertText("distanceNote")}</p>
+        </div>
+        <p id="alert-distance-note" className="detail-hint">
+          {alertText("distanceNote")}
+        </p>
 
         <label className="switch-row">
           <span className="switch-text">
