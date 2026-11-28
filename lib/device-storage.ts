@@ -1,4 +1,5 @@
 import { useMemo, useSyncExternalStore } from "react";
+import { ALERT_DISTANCES_MI, DEFAULT_ALERT_DISTANCE_MI, MAX_ALERT_PLACES } from "./push-cells";
 
 // Things ICEPik keeps only in this browser's localStorage. Never cookies:
 // cookies travel to the server with every request.
@@ -14,6 +15,9 @@ const LOCATION_KEY = "icepik.location";
 const CUSTOM_PLACES_KEYS = { real: "icepik.custom-places", demo: "icepik.demo.custom-places" };
 // "on" or "off": the moving background (Settings, "Moving background").
 const BACKGROUND_MOTION_KEY = "icepik.background-motion";
+// Push alerts' settings (lib/alerts/client.ts). Real map only: /demo has no
+// alerts. No place or position in it, only which places are watched (ids).
+const ALERTS_KEY = "icepik.alerts";
 
 function onDemoPage() {
   if (typeof window === "undefined") return false;
@@ -170,12 +174,80 @@ function newId() {
     : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 }
 
+export type AlertDistance = (typeof ALERT_DISTANCES_MI)[number];
+// on: alerts are on for this browser. placeIds: the watched places ("home",
+// "work" or a custom place's id). lastLocation: also watch where ICEPik was
+// last opened. showDetails: name the place and distance in notifications.
+// nearMeInApp: the in-app notice for new sightings near the live position.
+export type AlertSettings = {
+  on: boolean;
+  distanceMiles: AlertDistance;
+  placeIds: string[];
+  lastLocation: boolean;
+  showDetails: boolean;
+  nearMeInApp: boolean;
+};
+
+export const DEFAULT_ALERT_SETTINGS: AlertSettings = {
+  on: false,
+  distanceMiles: DEFAULT_ALERT_DISTANCE_MI,
+  placeIds: [],
+  lastLocation: false,
+  showDetails: false,
+  nearMeInApp: true,
+};
+
+export function useStoredAlertSettings(): AlertSettings {
+  const raw = useStored(ALERTS_KEY);
+  return useMemo(() => parseAlertSettings(raw), [raw]);
+}
+
+export function readAlertSettings(): AlertSettings {
+  return parseAlertSettings(read(ALERTS_KEY));
+}
+
+// False when it couldn't be saved: storage is blocked or full.
+export function saveAlertSettings(settings: AlertSettings) {
+  const clean = parseAlertSettings(JSON.stringify(settings));
+  return write(ALERTS_KEY, JSON.stringify(clean));
+}
+
+// The real map's places, outside React (the alerts read them on /).
+export function readSavedPlaces(): SavedPlaces {
+  return parsePlaces(read(PLACES_KEYS.real));
+}
+
+export function readCustomPlaces(): CustomPlace[] {
+  return parseCustomPlaces(read(CUSTOM_PLACES_KEYS.real));
+}
+
+function parseAlertSettings(raw: string | null | undefined): AlertSettings {
+  if (!raw) return DEFAULT_ALERT_SETTINGS;
+  try {
+    const value = JSON.parse(raw) as Partial<Record<keyof AlertSettings, unknown>>;
+    const bool = (v: unknown, fallback: boolean) => (typeof v === "boolean" ? v : fallback);
+    const distance = ALERT_DISTANCES_MI.find((d) => d === value.distanceMiles) ?? DEFAULT_ALERT_DISTANCE_MI;
+    const ids = Array.isArray(value.placeIds) ? value.placeIds.filter((id) => typeof id === "string") : [];
+    return {
+      on: bool(value.on, false),
+      distanceMiles: distance,
+      placeIds: [...new Set(ids as string[])].slice(0, MAX_ALERT_PLACES),
+      lastLocation: bool(value.lastLocation, false),
+      showDetails: bool(value.showDetails, false),
+      nearMeInApp: bool(value.nearMeInApp, true),
+    };
+  } catch {
+    return DEFAULT_ALERT_SETTINGS;
+  }
+}
+
 // "Clear this device": forget everything ICEPik stored in this browser.
 export function clearDeviceStorage() {
   // Both the real map's places and the demo's, wherever it's run from.
   for (const key of [...Object.values(PLACES_KEYS), ...Object.values(CUSTOM_PLACES_KEYS)]) write(key, null);
   write(LOCATION_KEY, null);
   write(BACKGROUND_MOTION_KEY, null);
+  write(ALERTS_KEY, null);
   write(POLICY_KEY, null);
 }
 

@@ -10,13 +10,19 @@ type Change = (pins: Map<string, Sighting>) => void;
 // expiries and deletions. Pins expire without an event, so the clock is
 // checked every 15 seconds, and missed events are covered by reloading when
 // the page comes back to the foreground, goes back online or reconnects.
-export function useLiveSightings(supabase: Client | null) {
+// onInsert hears each new pin that Realtime announces (never the pins a
+// load brings), for the in-app notice of new sightings nearby.
+export function useLiveSightings(supabase: Client | null, onInsert?: (sighting: Sighting) => void) {
   const [byId, setById] = useState<ReadonlyMap<string, Sighting>>(() => new Map());
   const [loadState, setLoadState] = useState<LoadState>("loading");
   const [now, setNow] = useState(() => Date.now());
   // Changes that arrive while a reload is in flight, replayed on top of its
   // result so a slow reload can't undo them.
   const inFlight = useRef(new Set<Change[]>());
+  const insertListener = useRef(onInsert);
+  useEffect(() => {
+    insertListener.current = onInsert;
+  });
 
   const apply = useCallback((change: Change) => {
     inFlight.current.forEach((queue) => queue.push(change));
@@ -67,6 +73,7 @@ export function useLiveSightings(supabase: Client | null) {
           } else {
             // INSERT or UPDATE: a new pin, new counts or a later expiry.
             upsert(change.new);
+            if (change.eventType === "INSERT") insertListener.current?.(change.new);
           }
         },
       )

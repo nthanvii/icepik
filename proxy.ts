@@ -65,7 +65,7 @@ export const config = {
     // link prefetches.
     {
       source:
-        "/((?!_next/static|_next/image|api/|favicon.ico|brand/|.*\\.(?:svg|png|jpg|jpeg|gif|webp)$).*)",
+        "/((?!_next/static|_next/image|api/|favicon.ico|brand/|sw\\.js$|.*\\.(?:svg|png|jpg|jpeg|gif|webp)$).*)",
       missing: [
         { type: "header", key: "next-router-prefetch" },
         { type: "header", key: "purpose", value: "prefetch" },

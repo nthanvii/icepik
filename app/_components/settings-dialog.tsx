@@ -12,6 +12,7 @@ import {
   normalizeUsername,
   usernameOf,
 } from "@/lib/accounts";
+import { disableAlerts } from "@/lib/alerts/client";
 import {
   CUSTOM_PLACES_MAX,
   clearDeviceStorage,
@@ -786,6 +787,7 @@ function DeleteAccount({ supabase, user, onNotice, onClose, onBack }: Props & { 
   // login ID, which is also what the sign-in uses.
   const loginId = user?.email ? user.email : null;
   const username = usernameOf(user) ?? loginId;
+  const demo = useDemo();
   const [password, setPassword] = useState("");
   const [token, setToken] = useState<string | null>(null);
   const [captchaReset, setCaptchaReset] = useState(0);
@@ -835,6 +837,9 @@ function DeleteAccount({ supabase, user, onNotice, onClose, onBack }: Props & { 
       // P0001: a message from ICEPik's own database checks, written for users.
       return setMessage(error.code === "P0001" ? error.message : "Something went wrong. Please try again.");
     }
+    // Push alerts have no account, so they outlive it: turn them off too.
+    // Not on /demo, where the account is the demo's.
+    if (!demo) await disableAlerts();
     // The account is gone, so just clear this device's session.
     await supabase.auth.signOut({ scope: "local" });
     onNotice("Your account was deleted. Its sightings stay on the map until they expire.");
@@ -905,7 +910,11 @@ function ClearDevice({ supabase, user, onBack }: Props & { onBack: () => void })
 
   async function clearDevice() {
     setBusy(true);
-    // Clear storage first. Forgetting the accepted policy returns to the first
+    // Push alerts belong to this browser, so they go on /demo too. First, so
+    // the server's copy is deleted with the stored id and secret before
+    // anything is cleared ("Keep the server in step").
+    await disableAlerts();
+    // Then storage. Forgetting the accepted policy returns to the first
     // screen, which unmounts the map and its auth listener. Signing out first
     // would let AccountStarter create a new account before the terms show.
     clearDeviceStorage();

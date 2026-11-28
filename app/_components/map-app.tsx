@@ -13,6 +13,9 @@ import {
   useSavedPlaces,
   type PlaceName,
 } from "@/lib/device-storage";
+import { useAlertSettings } from "@/lib/alerts/client";
+import { alertCategory, alertText, formatMiles, METERS_PER_MILE } from "@/lib/alerts/strings";
+import { useAlertsUpkeep, type OpenRequest } from "@/lib/alerts/upkeep";
 import { ONE_MILE_M, distanceMeters } from "@/lib/geo";
 import { readLayout, useLayout } from "@/lib/layout";
 import { anySpotIn, setTileTemplate, snapToPinnable, type SnapResult } from "@/lib/pinnable";
@@ -265,7 +268,11 @@ export function MapApp() {
   );
   // undefined until the saved session (if any) has been read.
   const [user, setUser] = useState<User | null | undefined>(undefined);
-  const { sightings, loadState, now, upsert, remove } = useLiveSightings(supabase);
+  // New pins from Realtime, for the in-app notice (set further down).
+  const newSightingRef = useRef<((sighting: Sighting) => void) | null>(null);
+  const { sightings, loadState, now, upsert, remove } = useLiveSightings(supabase, (sighting) =>
+    newSightingRef.current?.(sighting),
+  );
   const activity = useMyActivity(supabase, user?.id ?? null);
   const places = useSavedPlaces();
   const customPlaces = useCustomPlaces();
@@ -402,6 +409,58 @@ export function MapApp() {
   // The demo says what it is when it opens.
   useEffect(() => {
     if (demo) showNotice(DEMO_ABOUT);
+  }, [demo, showNotice]);
+
+  // Push alerts (lib/alerts): on the real map only, never on /demo.
+  const alertSettings = useAlertSettings();
+  const [openRequest, setOpenRequest] = useState<OpenRequest | null>(null);
+  useAlertsUpkeep({
+    enabled: !demo,
+    on: alertSettings.on,
+    lastLocation: alertSettings.lastLocation,
+    turnedOffReason: alertSettings.turnedOffReason,
+    position: me.position,
+    places,
+    customPlaces,
+    onNotice: showNotice,
+    onOpen: setOpenRequest,
+  });
+  // A new sighting within the alert distance of the live position shows a
+  // notice once, while ICEPik is open. Nothing is sent anywhere.
+  const alertsLatest = useRef({
+    position: me.position,
+    nearMeInApp: alertSettings.nearMeInApp,
+    distanceMiles: alertSettings.distanceMiles,
+    posts: activity.posts,
+  });
+  useEffect(() => {
+    alertsLatest.current = {
+      position: me.position,
+      nearMeInApp: alertSettings.nearMeInApp,
+      distanceMiles: alertSettings.distanceMiles,
+      posts: activity.posts,
+    };
+  });
+  const notifiedIds = useRef(new Set<string>());
+  useEffect(() => {
+    if (demo) return;
+    newSightingRef.current = (sighting) => {
+      if (notifiedIds.current.has(sighting.id)) return;
+      notifiedIds.current.add(sighting.id);
+      // A moment later, so a pin this person just posted counts as theirs.
+      window.setTimeout(() => {
+        const { position, nearMeInApp, distanceMiles, posts } = alertsLatest.current;
+        if (!nearMeInApp || !position || posts.has(sighting.id)) return;
+        const meters = distanceMeters(position.lat, position.lng, sighting.lat, sighting.lng);
+        if (meters > distanceMiles * METERS_PER_MILE) return;
+        showNotice(
+          alertText("inAppNotice", { category: alertCategory(sighting.category), distance: formatMiles(meters) }),
+        );
+      }, 1500);
+    };
+    return () => {
+      newSightingRef.current = null;
+    };
   }, [demo, showNotice]);
   const holdNotice = () => window.clearTimeout(noticeTimer.current);
   const releaseNotice = () => {
@@ -899,6 +958,20 @@ export function MapApp() {
     // On phones the panel covers the map, so get it out of the way.
     if (isPhone()) setPanelOpen(false);
   }
+
+  // A tapped alert: once the pins have loaded, open its sighting as tapping
+  // its pin does, or show where it was if it's gone.
+  const openRequested = useEffectEvent((request: OpenRequest) => {
+    if (sightings.some((s) => s.id === request.id)) return showSighting(request.id);
+    void mapApi.current?.focusSpot(request, mapPadding(), DETAIL_ZOOM);
+    showNotice(alertText("sightingGone"));
+  });
+  const handledOpen = useRef<OpenRequest | null>(null);
+  useEffect(() => {
+    if (!openRequest || openRequest === handledOpen.current || loadState !== "ready") return;
+    handledOpen.current = openRequest;
+    openRequested(openRequest);
+  }, [openRequest, loadState]);
 
   function showPoints(points: Point[]) {
     if (isPhone()) setPanelOpen(false);

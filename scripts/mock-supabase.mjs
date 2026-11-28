@@ -50,6 +50,10 @@
 // Authorization: never a body or a header), so a check can prove the demo's
 // reset never reached the real project.
 // POST /__mock/requests clears that list.
+// GET /__mock/push lists the push subscriptions as { id, cells } only (never
+// an endpoint, key or secret hash), for scripts/alerts-flows.mjs to see what
+// the server would alert for; POST /__mock/push deletes them all, as the
+// daily cleanup does to expired rows.
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import http from "node:http";
 
@@ -485,6 +489,11 @@ http
       if (req.method === "POST") requests = [];
       res.writeHead(200, h);
       return res.end(JSON.stringify(requests));
+    }
+    if (url.pathname === "/__mock/push") {
+      if (req.method === "POST") pushRows.clear();
+      res.writeHead(200, h);
+      return res.end(JSON.stringify([...pushRows.values()].map((r) => ({ id: r.id, cells: r.cells }))));
     }
     requests.push({ method: req.method, path: url.pathname, secretKey: isAdmin(req) });
     if (requests.length > 5000) requests.shift();
