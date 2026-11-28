@@ -690,7 +690,9 @@ function inPageChecks() {
     if (value < 3) report("icon", dot, value, 3);
   }
 
-  // Edges of text boxes, choice cards, the search box and the switch: an
+  // Edges of text boxes, choice cards, the search box and the switch (not the
+  // Alerts distance slider, which has no box: its filled track and thumb
+  // measured 3.11:1, its empty track 14.6:1, on the dark dialog): an
   // edge (border or shadow) or the box's own fill must reach 3:1 against
   // what's around it.
   const edgeColors = (s) => {
@@ -715,7 +717,7 @@ function inPageChecks() {
     return out;
   };
   const fields = document.querySelectorAll(
-    'input:not([type="radio"]):not([type="checkbox"]):not([type="hidden"]), textarea, select, .report-form .choice, .search-field, .switch-track',
+    'input:not([type="radio"]):not([type="checkbox"]):not([type="range"]):not([type="hidden"]), textarea, select, .report-form .choice, .search-field, .switch-track',
   );
   for (const field of fields) {
     if (!shown(field) || inactive(field) || !onTop(field)) continue;

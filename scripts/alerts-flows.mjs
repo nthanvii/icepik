@@ -1158,9 +1158,17 @@ if (wants("screen")) {
   seen = await footprint(page);
   check("...and registers the worker, with no database yet", seen.workers === 1 && !seen.database, JSON.stringify(seen));
 
-  const radios = await page.$$eval('input[name="alert-distance"]', (els) => els.map((el) => [el.value, el.checked]));
-  check("The distance group offers 1, 2 and 5 mi, 1 chosen first", JSON.stringify(radios) === '[["1",true],["2",false],["5",false]]', JSON.stringify(radios));
-  check("...in a fieldset with a legend", (await page.locator("fieldset legend").first().textContent()) === "Alert distance");
+  const slider = page.locator("#alert-distance");
+  const read = () => slider.evaluate((el) => ({ type: el.type, min: el.min, max: el.max, step: el.step, value: el.value, text: el.getAttribute("aria-valuetext") }));
+  check("The distance is a slider with three stops, at 1 mile first", JSON.stringify(await read()) === '{"type":"range","min":"0","max":"2","step":"1","value":"0","text":"1 mile"}', JSON.stringify(await read()));
+  check("...with a visible label", (await page.locator('label[for="alert-distance"]').textContent()).startsWith("Alert distance"));
+  await slider.focus();
+  await page.keyboard.press("End");
+  await waitFor(async () => (await settings(page))?.distanceMiles === 5, 5000, "5 mi to be saved");
+  check("The keyboard moves it to 5 mi, and it's saved", (await read()).text === "5 miles");
+  await page.keyboard.press("Home");
+  await waitFor(async () => (await settings(page))?.distanceMiles === 1, 5000, "1 mi to be saved");
+  check("...and back to 1 mi", (await read()).text === "1 mile");
   check("...with the line about farther alerts", (await page.locator(".settings").textContent()).includes("a little farther away"));
 
   const text = await page.locator(".settings").textContent();
