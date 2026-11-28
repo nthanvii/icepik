@@ -12,6 +12,8 @@ import {
   normalizeUsername,
   usernameOf,
 } from "@/lib/accounts";
+import { disableAlerts, useAlertSettings } from "@/lib/alerts/client";
+import { alertText } from "@/lib/alerts/strings";
 import {
   CUSTOM_PLACES_MAX,
   clearDeviceStorage,
@@ -39,6 +41,7 @@ import {
   useCaptcha,
   type ShownKey,
 } from "./account-recovery";
+import { AlertsSettings } from "./alerts-settings";
 import { BrandLogo } from "./brand-logo";
 import { DEMO_ABOUT, useDemo } from "./demo-context";
 import { Captcha, captchaEnabled } from "./captcha";
@@ -55,6 +58,7 @@ type View =
   | "delete"
   | "clear"
   | "policy"
+  | "alerts"
   | "forgot"
   | "key"
   | "newkey"
@@ -232,6 +236,9 @@ export function SettingsDialog(props: Props) {
       ) : null}
       {view === "key" && shownKey ? (
         <RecoveryKeyShown shown={shownKey} onDone={() => keyDone(shownKey)} />
+      ) : null}
+      {view === "alerts" ? (
+        <AlertsSettings places={props.places} customPlaces={props.customPlaces} onBack={back} />
       ) : null}
       {view === "delete" ? <DeleteAccount {...props} onBack={back} /> : null}
       {view === "clear" ? <ClearDevice {...props} onBack={back} /> : null}
@@ -464,6 +471,19 @@ function MainView({
         </p>
       </section>
 
+      {demo ? null : (
+        <section className="settings-section" aria-labelledby="alerts-title">
+          <h3 id="alerts-title">{alertText("screenTitle")}</h3>
+          <p className="detail-hint">{alertText("entryIntro")}</p>
+          <AlertsStatus />
+          <div className="button-row">
+            <button type="button" className="secondary-button" data-opens="alerts" onClick={() => onOpen("alerts")}>
+              {alertText("entryButton")}
+            </button>
+          </div>
+        </section>
+      )}
+
       <section className="settings-section" aria-labelledby="display-title">
         <h3 id="display-title">Display</h3>
         <label className="switch-row">
@@ -512,6 +532,12 @@ function MainView({
       </section>
     </>
   );
+}
+
+// On or off, read from this device's settings (no IndexedDB).
+function AlertsStatus() {
+  const { on } = useAlertSettings();
+  return <p className="detail-hint">{alertText(on ? "entryOn" : "entryOff")}</p>;
 }
 
 function SaveAccount({
@@ -786,6 +812,7 @@ function DeleteAccount({ supabase, user, onNotice, onClose, onBack }: Props & { 
   // login ID, which is also what the sign-in uses.
   const loginId = user?.email ? user.email : null;
   const username = usernameOf(user) ?? loginId;
+  const demo = useDemo();
   const [password, setPassword] = useState("");
   const [token, setToken] = useState<string | null>(null);
   const [captchaReset, setCaptchaReset] = useState(0);
@@ -835,6 +862,9 @@ function DeleteAccount({ supabase, user, onNotice, onClose, onBack }: Props & { 
       // P0001: a message from ICEPik's own database checks, written for users.
       return setMessage(error.code === "P0001" ? error.message : "Something went wrong. Please try again.");
     }
+    // Push alerts have no account, so they outlive it: turn them off too.
+    // Not on /demo, where the account is the demo's.
+    if (!demo) await disableAlerts();
     // The account is gone, so just clear this device's session.
     await supabase.auth.signOut({ scope: "local" });
     onNotice("Your account was deleted. Its sightings stay on the map until they expire.");
@@ -905,7 +935,11 @@ function ClearDevice({ supabase, user, onBack }: Props & { onBack: () => void })
 
   async function clearDevice() {
     setBusy(true);
-    // Clear storage first. Forgetting the accepted policy returns to the first
+    // Push alerts belong to this browser, so they go on /demo too. First, so
+    // the server's copy is deleted with the stored id and secret before
+    // anything is cleared ("Keep the server in step").
+    await disableAlerts();
+    // Then storage. Forgetting the accepted policy returns to the first
     // screen, which unmounts the map and its auth listener. Signing out first
     // would let AccountStarter create a new account before the terms show.
     clearDeviceStorage();

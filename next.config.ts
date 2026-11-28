@@ -24,6 +24,10 @@ if (
 }
 
 const nextConfig: NextConfig = {
+  // `next dev` logs every Server Function call with its arguments by default,
+  // which would print places, push keys and device secrets to the terminal
+  // (AGENTS.md: never log them). Production never logs them.
+  logging: { serverFunctions: false },
   async headers() {
     return [
       {
@@ -38,6 +42,17 @@ const nextConfig: NextConfig = {
             value:
               "default-src 'none'; connect-src https://basemaps.cartocdn.com https://tiles.basemaps.cartocdn.com",
           },
+        ],
+      },
+      {
+        // The push alerts' service worker (public/sw.js). The proxy skips it,
+        // so it gets neither the page's policy nor a session refresh. It is
+        // never cached, so a fix reaches every phone on its next check.
+        source: "/sw.js",
+        headers: [
+          { key: "Content-Type", value: "application/javascript; charset=utf-8" },
+          { key: "Cache-Control", value: "no-cache, no-store, must-revalidate" },
+          { key: "Content-Security-Policy", value: "default-src 'self'; script-src 'self'" },
         ],
       },
     ];

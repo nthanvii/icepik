@@ -31,10 +31,29 @@
 //   replace_recovery_key;
 // - the admin API (secret key): list accounts, and set a password, which
 //   ends every session of that account.
+// Push alerts, as database/icepik_schema.sql, with the secret key only (any
+// other caller gets permission denied): push_create, push_update and
+// push_delete, in memory, with the SQL's results and errors (push_invalid,
+// push_endpoint_taken, a table check's 23514). Only the device secret's
+// SHA-256 is kept.
+// The alert sender's shared VAPID tokens (push_vapid_tokens), in memory, as
+// the same file: push_vapid_put stores or replaces the token of a push
+// service's origin (push_invalid for an expiry that is missing, past or more
+// than 24 hours ahead; a table check's 23514 for a bad origin, public key,
+// subject or header), and push_vapid_get returns it only for the same
+// public key and subject with at least 15 minutes left, else null. Both take
+// the secret key in apikey, with no Authorization header (as the Edge
+// Function sends it) or with "Bearer <secret key>" (as supabase-js does);
+// any other caller gets permission denied.
 // GET /__mock/requests lists the requests this project received (method,
-// path, and whether they used the secret key: never a body or a header), so
-// a check can prove the demo's reset never reached the real project.
+// path, and whether they used the secret key in both apikey and
+// Authorization: never a body or a header), so a check can prove the demo's
+// reset never reached the real project.
 // POST /__mock/requests clears that list.
+// GET /__mock/push lists the push subscriptions as { id, cells } only (never
+// an endpoint, key or secret hash), for scripts/alerts-flows.mjs to see what
+// the server would alert for; POST /__mock/push deletes them all, as the
+// daily cleanup does to expired rows.
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import http from "node:http";
 
@@ -297,6 +316,158 @@ async function accounts(req, url) {
   return [200, replaceKey(u)];
 }
 
+// Push alerts (push_subscriptions in database/icepik_schema.sql).
+const pushRows = new Map();
+const PUSH_ENDPOINT =
+  /^https:\/\/(fcm\.googleapis\.com|jmt17\.google\.com|web\.push\.apple\.com|updates\.push\.services\.mozilla\.com|[a-z0-9-]+\.notify\.windows\.com)\//;
+const pushHash = (secret) => (typeof secret === "string" ? createHash("sha256").update(secret, "utf8").digest("hex") : null);
+const plusDays = (days) => new Date(Date.now() + days * 86400000).toISOString().slice(0, 10);
+const checkViolation = () => dbError('new row for relation "push_subscriptions" violates check constraint', "23514");
+// push_clean_cells(): sorted, without repeats; push_invalid off the grid.
+function pushCleanCells(cells) {
+  if (cells === null || cells === undefined) return { cells: null };
+  if (!Array.isArray(cells)) return { error: dbError("malformed array literal", "22P02") };
+  if (cells.some((c) => !Number.isSafeInteger(c) || c < 0 || c > 180019999 || c % 20000 > 13846)) {
+    return { error: dbError("push_invalid") };
+  }
+  return { cells: [...new Set(cells)].sort((a, b) => a - b) };
+}
+// The table's checks.
+const pushRowOk = (r) =>
+  typeof r.endpoint === "string" &&
+  r.endpoint.length <= 1024 &&
+  PUSH_ENDPOINT.test(r.endpoint) &&
+  typeof r.p256dh === "string" &&
+  /^[A-Za-z0-9_-]{87}$/.test(r.p256dh) &&
+  typeof r.auth === "string" &&
+  /^[A-Za-z0-9_-]{22}$/.test(r.auth) &&
+  r.cells.length >= 1 &&
+  r.cells.length <= 1000;
+
+async function push(req, url) {
+  const rpc = url.pathname.match(/^\/rest\/v1\/rpc\/(push_create|push_update|push_delete)$/);
+  if (!rpc || req.method !== "POST") return null;
+  const input = await readBody(req);
+  if (!isAdmin(req)) return dbError(`permission denied for function ${rpc[1]}`, "42501");
+
+  if (rpc[1] === "push_create") {
+    if (typeof input.p_secret !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(input.p_secret)) return dbError("push_invalid");
+    const clean = pushCleanCells(input.p_cells);
+    if (clean.error) return clean.error;
+    const row = {
+      id: randomUUID(),
+      endpoint: input.p_endpoint,
+      p256dh: input.p_p256dh,
+      auth: input.p_auth,
+      cells: clean.cells ?? [],
+      secretHash: pushHash(input.p_secret),
+      createdOn: plusDays(0),
+      expiresOn: plusDays(30),
+    };
+    if (!pushRowOk(row)) return checkViolation();
+    if ([...pushRows.values()].some((r) => r.endpoint === row.endpoint)) return dbError("push_endpoint_taken");
+    pushRows.set(row.id, row);
+    return [200, row.id];
+  }
+
+  const found = pushRows.get(input.p_id);
+  const matches = Boolean(found && pushHash(input.p_secret) !== null && found.secretHash === pushHash(input.p_secret));
+  if (rpc[1] === "push_delete") {
+    if (matches) pushRows.delete(found.id);
+    return [200, matches];
+  }
+
+  // push_update
+  const swap = [input.p_endpoint, input.p_p256dh, input.p_auth].map((v) => v === undefined || v === null);
+  if (swap[0] !== swap[1] || swap[0] !== swap[2]) return dbError("push_invalid");
+  const clean = pushCleanCells(input.p_cells);
+  if (clean.error) return clean.error;
+  if (!matches) return [200, false];
+  const next = {
+    ...found,
+    cells: clean.cells ?? found.cells,
+    endpoint: input.p_endpoint ?? found.endpoint,
+    p256dh: input.p_p256dh ?? found.p256dh,
+    auth: input.p_auth ?? found.auth,
+    expiresOn: plusDays(30),
+  };
+  if (!pushRowOk(next)) return checkViolation();
+  if ([...pushRows.values()].some((r) => r.id !== next.id && r.endpoint === next.endpoint)) {
+    return dbError("push_endpoint_taken");
+  }
+  pushRows.set(next.id, next);
+  return [200, true];
+}
+
+// The alert sender's VAPID tokens (push_vapid_tokens in
+// database/icepik_schema.sql), by push service origin.
+const vapidRows = new Map();
+const PUSH_ORIGIN =
+  /^https:\/\/(fcm\.googleapis\.com|jmt17\.google\.com|web\.push\.apple\.com|updates\.push\.services\.mozilla\.com|[a-z0-9-]+\.notify\.windows\.com)$/;
+const VAPID_HEADER = /^vapid t=[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+, k=[A-Za-z0-9_-]{87}$/;
+const MINUTE = 60000;
+// The secret key in apikey, with no Authorization header (the Edge
+// Function's way) or with the same key as a Bearer token (supabase-js's way).
+const isSecretKey = (req) =>
+  req.headers.apikey === SECRET_KEY &&
+  (req.headers.authorization === undefined || req.headers.authorization === `Bearer ${SECRET_KEY}`);
+// The table's checks.
+const vapidRowOk = (r) =>
+  PUSH_ORIGIN.test(r.origin) &&
+  /^[A-Za-z0-9_-]{87}$/.test(r.publicKey) &&
+  Array.from(r.subject).length <= 512 &&
+  /^(mailto:|https:\/\/)[^\s<>]+$/.test(r.subject) &&
+  r.header.length <= 2048 &&
+  VAPID_HEADER.test(r.header) &&
+  r.header.slice(-87) === r.publicKey;
+
+async function vapid(req, url) {
+  const rpc = url.pathname.match(/^\/rest\/v1\/rpc\/(push_vapid_get|push_vapid_put)$/);
+  if (!rpc || req.method !== "POST") return null;
+  const input = (await readBody(req)) ?? {};
+  if (!isSecretKey(req)) return dbError(`permission denied for function ${rpc[1]}`, "42501");
+
+  if (rpc[1] === "push_vapid_get") {
+    const row = vapidRows.get(input.p_origin);
+    const usable =
+      row !== undefined &&
+      row.publicKey === input.p_public_key &&
+      row.subject === input.p_subject &&
+      row.expiresAt >= Date.now() + 15 * MINUTE;
+    // PostgREST answers a function's text as JSON, and SQL null as null.
+    return usable ? [200, row.header] : [200, null, "null"];
+  }
+
+  // push_vapid_put
+  const at = input.p_expires_at ?? null;
+  if (at !== null && (typeof at !== "string" || Number.isNaN(Date.parse(at)))) {
+    return dbError("invalid input syntax for type timestamp with time zone", "22007");
+  }
+  const expiresAt = at === null ? null : Date.parse(at);
+  if (expiresAt === null || expiresAt <= Date.now() || expiresAt > Date.now() + 24 * 60 * MINUTE) {
+    return dbError("push_invalid");
+  }
+  const row = {
+    origin: input.p_origin ?? null,
+    publicKey: input.p_public_key ?? null,
+    subject: input.p_subject ?? null,
+    header: input.p_header ?? null,
+    expiresAt,
+  };
+  const column = { origin: "origin", publicKey: "public_key", subject: "subject", header: "header" };
+  const missing = Object.keys(column).find((k) => row[k] === null);
+  if (missing) {
+    const message = `null value in column "${column[missing]}" of relation "push_vapid_tokens" violates not-null constraint`;
+    return dbError(message, "23502");
+  }
+  if (Object.keys(column).some((k) => typeof row[k] !== "string") || !vapidRowOk(row)) {
+    return dbError('new row for relation "push_vapid_tokens" violates check constraint', "23514");
+  }
+  // on conflict (origin) do update: the last writer wins.
+  vapidRows.set(row.origin, row);
+  return [204, null];
+}
+
 http
   .createServer(async (req, res) => {
     const h = {
@@ -319,13 +490,18 @@ http
       res.writeHead(200, h);
       return res.end(JSON.stringify(requests));
     }
+    if (url.pathname === "/__mock/push") {
+      if (req.method === "POST") pushRows.clear();
+      res.writeHead(200, h);
+      return res.end(JSON.stringify([...pushRows.values()].map((r) => ({ id: r.id, cells: r.cells }))));
+    }
     requests.push({ method: req.method, path: url.pathname, secretKey: isAdmin(req) });
     if (requests.length > 5000) requests.shift();
-    const answer = await accounts(req, url);
+    const answer = (await accounts(req, url)) ?? (await push(req, url)) ?? (await vapid(req, url));
     if (answer) {
-      const [code, json] = answer;
+      const [code, json, raw] = answer;
       res.writeHead(code, h);
-      return res.end(json === null ? "" : JSON.stringify(json));
+      return res.end(raw ?? (json === null ? "" : JSON.stringify(json)));
     }
     if (url.pathname === "/rest/v1/sightings" && req.method === "GET") {
       clock = Date.now();

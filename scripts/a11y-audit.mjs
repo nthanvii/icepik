@@ -24,6 +24,10 @@
 //   Options: --sizes 1280x800,390x844  --schemes light,dark  --states home,alert
 //            --url http://127.0.0.1:3000  --skip-glass  --verbose
 //
+// The alerts states need the app built with a throwaway
+// NEXT_PUBLIC_VAPID_PUBLIC_KEY (any 65-byte P-256 point in base64url, never a
+// real key); without one they fail with "state could not be reached".
+//
 // Needs the app on --url, built and started against the stand-in database
 // (scripts/mock-supabase.mjs on port 54321), like scripts/capture-layout.mjs,
 // and the demo's stand-in on port 54322 for the forgot-demo state. The
@@ -80,6 +84,15 @@ const STATES = [
   "newkey-error",
   "key-error",
   "nokey",
+  // Alerts: they need the app built with a throwaway NEXT_PUBLIC_VAPID_PUBLIC_KEY
+  // (see the top). The "on" states come last: they turn alerts on.
+  "alerts",
+  "alerts-refused",
+  "alerts-ios",
+  "alerts-blocked",
+  "alerts-unsupported",
+  "alerts-on",
+  "alerts-last",
 ];
 
 function option(name, fallback) {
@@ -325,8 +338,87 @@ const RECOVERY_STEPS = {
   },
 };
 
+
+// --- Alerts (Settings > Alerts) ---------------------------------------------
+// The browser's push subscription is a stand-in (see alertStubs), and the
+// states that depend on the browser (an iPhone outside the Home Screen app,
+// blocked or missing notifications) are made with a flag kept in
+// sessionStorage, read by alertStubs on each load.
+const ALERT_PLACES = {
+  home: { lat: 39.9612, lng: -75.1588 },
+  custom: [{ id: "a11y-place-clinic", name: "Clinic", lat: 39.9405, lng: -75.1503 }],
+};
+
+async function alertsState(page, flag) {
+  await page.evaluate(
+    ({ flag, places }) => {
+      if (flag) sessionStorage.setItem("__a11y_alerts", flag);
+      else sessionStorage.removeItem("__a11y_alerts");
+      localStorage.setItem("icepik.places", JSON.stringify({ home: places.home }));
+      localStorage.setItem("icepik.custom-places", JSON.stringify(places.custom));
+    },
+    { flag, places: ALERT_PLACES },
+  );
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.waitForSelector(".pin-icon", { state: "attached" });
+}
+
+async function openAlerts(page) {
+  await openSettings(page);
+  await page.click('[data-opens="alerts"]');
+  await page.waitForSelector("#alerts-view-title");
+  await page.waitForTimeout(800);
+}
+
+// Alerts on, through the real button, with the stand-in subscription.
+async function alertsOn(page) {
+  await alertsState(page, null);
+  await openAlerts(page);
+  if (await page.locator("#alerts-on-title").count()) return;
+  const home = page.locator("#alert-place-home").locator("xpath=ancestor::label//input");
+  if (!(await home.isChecked())) await home.click();
+  await page.locator('.settings input[type="checkbox"]:not([role])').check();
+  await page.waitForFunction(() => /Ready to turn on/.test(document.body.textContent), null, { timeout: 20000 });
+  await page.click(".settings .primary-button");
+  await page.waitForSelector("#alerts-on-title", { timeout: 20000 });
+  await page.waitForTimeout(500);
+}
+
+const ALERT_STEPS = {
+  async alerts(page) {
+    await alertsState(page, null);
+    await openAlerts(page);
+  },
+  async "alerts-refused"(page) {
+    await STEPS.alerts(page);
+    await page.click(".settings .primary-button", { force: true });
+    await page.waitForFunction(() => document.querySelector(".settings [role=status]")?.textContent.trim());
+  },
+  async "alerts-ios"(page) {
+    await alertsState(page, "ios");
+    await openAlerts(page);
+  },
+  async "alerts-blocked"(page) {
+    await alertsState(page, "blocked");
+    await openAlerts(page);
+  },
+  async "alerts-unsupported"(page) {
+    await alertsState(page, "unsupported");
+    await openAlerts(page);
+  },
+  async "alerts-on"(page) {
+    await alertsOn(page);
+  },
+  async "alerts-last"(page) {
+    await alertsOn(page);
+    await page.locator("#last-label").locator("xpath=ancestor::label//input").click();
+    await page.waitForSelector("#last-title");
+  },
+};
+
 const STEPS = {
   ...RECOVERY_STEPS,
+  ...ALERT_STEPS,
   async home() {},
   async "map-only"(page, { compact }) {
     await page.click(compact ? ".rail-home" : ".rail-reports");
@@ -867,6 +959,55 @@ async function auditSize(browser, size, scheme) {
   };
   const context = await browser.newContext(contextOptions);
   await context.addInitScript(() => localStorage.setItem("icepik.location", "denied"));
+  await context.addInitScript(() => {
+    // Stand-in push subscription and the "browser can't" flags of the
+    // Alerts states (see ALERT_STEPS). Nothing reaches a push service.
+    const flag = sessionStorage.getItem("__a11y_alerts");
+    const KEY = "__a11yPushStub";
+    const b64 = (n) => {
+      const bytes = crypto.getRandomValues(new Uint8Array(n));
+      return btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    };
+    const read = () => {
+      try {
+        return JSON.parse(sessionStorage.getItem(KEY));
+      } catch {
+        return null;
+      }
+    };
+    const make = (state) =>
+      state && {
+        endpoint: state.endpoint,
+        expirationTime: null,
+        options: { userVisibleOnly: true },
+        getKey: () => null,
+        toJSON: () => ({ endpoint: state.endpoint, expirationTime: null, keys: { p256dh: state.p256dh, auth: state.auth } }),
+        unsubscribe: () => {
+          sessionStorage.removeItem(KEY);
+          return Promise.resolve(true);
+        },
+      };
+    if (typeof PushManager !== "undefined") {
+      PushManager.prototype.subscribe = () => {
+        const state = { endpoint: `https://fcm.googleapis.com/fcm/send/a11y-${b64(18)}`, p256dh: b64(65), auth: b64(16) };
+        sessionStorage.setItem(KEY, JSON.stringify(state));
+        return Promise.resolve(make(state));
+      };
+      PushManager.prototype.getSubscription = () => Promise.resolve(make(read()));
+    }
+    const permission = flag === "blocked" ? "denied" : "granted";
+    if (typeof Notification !== "undefined") {
+      Object.defineProperty(Notification, "permission", { configurable: true, get: () => permission });
+    }
+    if (flag === "ios") {
+      Object.defineProperty(navigator, "userAgent", {
+        configurable: true,
+        get: () => "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
+      });
+      delete window.PushManager;
+    }
+    if (flag === "unsupported") delete window.Notification;
+  });
   const page = await context.newPage();
   await guard(page);
   page.on("pageerror", (error) => console.error(`  ${size} ${scheme}: page error: ${firstLine(error)}`));

@@ -4,7 +4,7 @@ Nov 19, 2026 · @Juan
 
 ## Overview
 
-The ICEPik backend is ready for the MVP: a Supabase Postgres database with five tables, the database functions the app and its server actions call, and a live feed of map pins. Browsers read pins and manage their own account with supabase-js and the publishable key; posting, voting, deleting a pin and password resets go through Next.js server actions. The server enforces every rule, so the app can't break them by accident.
+The ICEPik backend is ready for the MVP: a Supabase Postgres database with seven tables (two of them for push alerts), the database functions the app and its server actions call, and a live feed of map pins. Browsers read pins and manage their own account with supabase-js and the publishable key; posting, voting, deleting a pin and password resets go through Next.js server actions. The server enforces every rule, so the app can't break them by accident.
 
 **The one rule everything follows:** nothing another user can read may connect a person to a place. Pins are public. Who posted or voted on a pin is private to that person, and those records are deleted within an hour after the pin expires. The section "What we need from you" lists how the app keeps this rule too.
 
@@ -33,7 +33,7 @@ Confirm these nine Supabase settings with the backend owner, then set up the cli
 | Sign In / Providers → Email → Password Requirements | No required characters | The app suggests a few random words; requiring capitals, digits or symbols refuses those (the live checks' step 2a fails), and NIST advises against such rules |
 | Sign In / Providers → Email → Require current password when changing password | On | Someone holding an unlocked phone can't change the password without knowing it |
 
-**Secret key.** The password reset needs Supabase's secret key (`sb_secret_…`; the older service\_role keys are being retired at the end of 2026). Add it in Vercel as `SUPABASE_SECRET_KEY` to the **Production** environment only, with **Sensitive** turned on: never to Preview or Development or a developer's .env.local (use a scratch project's keys to try the reset locally), and never with a `NEXT_PUBLIC_` name. Only `lib/supabase/admin.ts` reads it; on a deployment without it, the reset answers that it isn't available. The key skips every database rule, so a leak would expose the private links between people and pins, and every account. If it leaks, make a new secret key in Supabase and delete the old one. The demo project's secret key, `DEMO_SUPABASE_SECRET_KEY`, follows the same rules (Production only, Sensitive, never `NEXT_PUBLIC_`); only the demo's reset uses it.
+**Secret key.** The password reset needs Supabase's secret key (`sb_secret_…`; the older service\_role keys are being retired at the end of 2026). Add it in Vercel as `SUPABASE_SECRET_KEY` to the **Production** environment only, with **Sensitive** turned on: never to Preview or Development or a developer's .env.local (use a scratch project's keys to try the reset locally), and never with a `NEXT_PUBLIC_` name. Only `lib/supabase/admin.ts` reads it, for the password reset and push alerts (`app/actions/push.ts`); on a deployment without it, the reset answers that it isn't available and push alerts that they aren't. The key skips every database rule, so a leak would expose the private links between people and pins, and every account. If it leaks, make a new secret key in Supabase and delete the old one. The demo project's secret key, `DEMO_SUPABASE_SECRET_KEY`, follows the same rules (Production only, Sensitive, never `NEXT_PUBLIC_`); only the demo's reset uses it.
 
 **Existing project.** ICEPik's own Supabase project had no real users, so it was started over instead: its ICEPik tables, functions and accounts were deleted and the whole schema was run fresh. A project that still runs the earlier schema and holds real data upgrades with `database/migrations/20261116_recovery_keys.sql`, never the whole schema or its "Starting over" lines, which delete every pin, vote and profile total. The file's header has the steps; do them in this order. (0) Run `scripts/supabase-live-checks.mjs` on a scratch project, and stop unless every check passes. (1) Make sure the Turnstile widget's hostname list includes the live domain, and deploy the app version that ships with the migration (ICEPik's Turnstile site key is built into `app/_components/captcha.tsx`; a production build stops if `NEXT_PUBLIC_TURNSTILE_SITE_KEY` is set to an empty value, which would turn the check off). Its "Delete my account" asks a saved account for its password, which the migration starts to require, and it works with the old database too. Open the site in a private window, accept the terms, and check that the Turnstile check completes and a new anonymous user appears. (2) Count the saved accounts whose login ID breaks the username rule, and delete or rename them: once the migration has run they can be deleted but no longer renamed. The app can't log them in or reset their password (one already signed in on a device can still delete itself). (3) Run the migration. (4) Turn on the settings above, CAPTCHA last. (5) Repeat the private-window check with CAPTCHA on.
 
@@ -72,7 +72,7 @@ delete from public.sightings where description = 'TEST';
 
 ## Data model
 
-The app works with four tables; a fifth, recovery\_keys, is reached only through database functions. Only `sightings` is public, and only while a pin is active; the other three return just the signed-in user's own rows.
+The app works with four tables; a fifth, recovery\_keys, is reached only through database functions, and so are the two push alert tables (see "Push alerts"). Only `sightings` is public, and only while a pin is active; the other three return just the signed-in user's own rows.
 
 ![How the app reaches the database: 1 public table, 4 private](images/how-the-app-reaches-the-database.png)
 
@@ -104,6 +104,8 @@ The app reads active pins (signed in or not) and inserts new ones. It deletes it
 | `sighting_reporters` | `sighting_id`, `reporter_id` | Read your own rows to list "my posts". The server writes them and deletes them after the pin expires |
 | `profiles` | `id` (the user's id), `preferred_language`, `sightings_posted`, `votes_cast`, `post_limit_hour`, `post_limit_count`, `created_at` | Read your own profile. Change `preferred_language` only through `set_my_language()` |
 | `recovery_keys` | `user_id`, `key_hash` (SHA-256 of the key) | Nothing: the browser roles have no grants on it and there are no row policies. Only the recovery-key functions read or write it |
+| `push_subscriptions` | `id`, `endpoint`, `p256dh`, `auth`, `cells` (the ~2.2 km squares to alert for), `secret_hash` (SHA-256 of the device secret), `created_on`, `expires_on` (dates, no time of day) | Nothing: no grants for the browser roles and no row policies. Only the push functions, called with the secret key, read or write it. See "Push alerts" below |
+| `push_vapid_tokens` | `origin` (a push service), `public_key`, `subject`, `header` (a signed VAPID `Authorization` value), `expires_at` | Nothing: no grants for the browser roles and no row policies. Only `push_vapid_get` and `push_vapid_put`, called with the secret key, read or write it. It never holds the private key. See "Push alerts" below |
 
 ### Server functions
 
@@ -118,6 +120,14 @@ The app reads active pins (signed in or not) and inserts new ones. It deletes it
 | `has_recovery_key()` | Signed in | Whether you have a recovery key; ask a saved account without one to make one |
 | `check_recovery_key(p_username, p_key)` | Server only (secret key) | The account id when the username and key match, otherwise nothing |
 | `replace_recovery_key(p_user_id)` | Server only (secret key) | Gives the account a new key after a reset and returns it once |
+| `push_create(p_endpoint, p_p256dh, p_auth, p_cells, p_secret)` | Server only (secret key) | Called by `createPushSubscription` after its Turnstile check. Saves a subscription and returns its id; `push_endpoint_taken` if the endpoint is already saved |
+| `push_update(p_id, p_secret, p_cells?, p_endpoint?, p_p256dh?, p_auth?)` | Server only (secret key) | Called by `updatePushSubscription` and `POST /api/push/renew`. Renews for 30 days, and replaces the cells or swaps the endpoint and keys (all three together); false when the id or secret doesn't match |
+| `push_delete(p_id, p_secret)` | Server only (secret key) | Called by `deletePushSubscription`. False when the id or secret doesn't match |
+| `push_targets(p_lat, p_lng, p_after, p_limit)` | Server only (secret key) | For the sender (the `push-sightings` Edge Function): the live subscriptions whose cells hold a sighting's square, at most 500 per page, in id order |
+| `push_drop(p_ids)` | Server only (secret key) | For the sender: deletes subscriptions whose push service says they're gone |
+| `push_vapid_get(p_origin, p_public_key, p_subject)` | Server only (secret key) | For the sender: the stored `Authorization` value for a push service, or null unless it was signed with that public key and subject and has at least 15 minutes left |
+| `push_vapid_put(p_origin, p_public_key, p_subject, p_header, p_expires_at)` | Server only (secret key) | For the sender: stores a newly signed `Authorization` value for a push service, replacing the one before (the last write wins); `push_invalid` for an expiry that is missing, past or more than 24 hours ahead |
+| `push_cell(p_lat, p_lng)`, `push_purge()` | Nobody through the API | The square id for a point (same as `cellOf()` in `lib/push-cells.ts`), and the daily cleanup of old subscriptions and expired tokens |
 
 ## How to call it
 
@@ -331,12 +341,14 @@ import type { Database } from '@/database.types'
 
 /**
  * Supabase client with the SECRET key. It skips every database rule, so it is
- * used in exactly one place: the password reset in app/actions/recovery.ts.
- * Never import it anywhere else, and never give the key a NEXT_PUBLIC_ name.
+ * used in exactly two places: account recovery (the password reset in
+ * app/actions/recovery.ts) and push alerts (app/actions/push.ts, which
+ * app/api/push/renew/route.ts calls). Never import it anywhere else, and never
+ * give the key a NEXT_PUBLIC_ name.
  *
  * SUPABASE_SECRET_KEY is set in Vercel's Production environment only, marked
- * Sensitive. Preview deployments don't get it, so there this returns null and
- * the reset says it isn't available.
+ * Sensitive. Preview deployments don't get it, so there this returns null, and
+ * the reset and push alerts say they aren't available.
  */
 export function createAdminClient() {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL
@@ -704,7 +716,7 @@ Supabase, Vercel and CARTO's tile servers all see every visitor's IP address and
 - **The vector map.** Where the browser has WebGL 2, MapLibre GL draws the map from CARTO's vector tiles instead of the Positron images, and lets it zoom in two steps further. Bundle MapLibre from npm like Leaflet, with its worker served from your own origin; the worker is a static file the page's policy doesn't reach, so `next.config.ts` gives it its own Content-Security-Policy allowing only CARTO's two vector hosts. The Content-Security-Policy's `connect-src` then also allows `https://basemaps.cartocdn.com` and `https://tiles.basemaps.cartocdn.com`, for the map's style, tiles, fonts and icons, which carry no key. Without WebGL 2, or when the style or the vector tiles can't be loaded, the map falls back to the images.
 - **Keep the browser's default referrer policy.** `strict-origin-when-cross-origin` sends other sites only your domain, never the page path. Don't use `no-referrer`: a CARTO key restricted to your website is checked against the Referer.
 - **Geocode on the server.** Call the reverse geocoder (and Google Translate, later) from a route handler with only the rounded point, so the provider sees Vercel's IP. Never `console.log` request bodies or coordinates: Vercel keeps runtime logs.
-- **Protect shared devices.** Add "Clear this device" in Settings to delete saved places and sign out. If the account isn't saved, say that this ends it for good and offer Save account first. Keep street names out of page titles, which show in tabs and history.
+- **Protect shared devices.** Add "Clear this device" in Settings to delete saved places and sign out. Once push alerts exist, it turns them off too, as "Keep the server in step" under "Push alerts" says, before it clears anything. If the account isn't saved, say that this ends it for good and offer Save account first. Keep street names out of page titles, which show in tabs and history.
 - **Don't drop new pins on the reporter's GPS position.** Let them place the pin, and suggest posting after they've left the area: a fresh pin shows roughly where its reporter is standing.
 - **Snap every new pin in the browser, and send only the snapped spot.** `snapToPinnable()` (`lib/pinnable.ts`) moves a tapped, dragged or searched point to the nearest point on the 0.001° grid that is on land and within 200 m of a road or footpath, using CARTO's vector map tiles for that area. Before checking, the map zooms in to the spot (Leaflet zoom 16) and waits for the vector map to load it, so the check reads the same tile URLs from the browser's cache. In testing at 375 px wide and up, every check's tiles came from the cache. On a 320 px wide phone, a check that reads the whole 500 m box (the nearest grid point isn't pinnable) fetched 1 or 2 of its 4 tiles from CARTO, because that screen shows less than the box. Without WebGL 2 the map shows images and has no vector tiles, so each check downloads CARTO's style once and up to about nine zoom-15 vector tiles around the spot at the moment a pin is placed: CARTO and its CDN could then link an IP address to the area of a pin that goes public moments later. If CARTO's vector tiles can't be reached, the check fails closed ("Couldn't check this spot. Try again.") and no pin is placed. It sends CARTO tile numbers only, never coordinates. The exact point, including a searched address's coordinates, never leaves the browser: only the snapped spot goes to `/api/reverse` and `postSighting`. Existing pins are left as they are.
 - **Take pins only where ICE works.** `lib/service-area.ts` holds the outline of the 50 states, DC, Puerto Rico, the U.S. Virgin Islands, Guam and the Northern Mariana Islands (README, section 6). The browser checks it first, with no network request, and refuses anything outside before reading any map tiles. `postSighting` checks the same outline on the server and refuses a point outside, so a direct call can't post one. The database itself doesn't check this: a rule in the `sightings` insert policy or a trigger would be the place, if we want it there too.
@@ -716,7 +728,7 @@ Server actions are public endpoints: anyone can call one directly with any input
 - **Check every argument at runtime.** TypeScript types aren't enforced when a request arrives. `sightings.ts` checks types, ranges and lengths before touching the database; any new action must do the same.
 - **Build database rows field by field.** Never pass the caller's object into `.insert()` or `.update()`, or they could set fields such as `expires_at`.
 - **Take the user from the session, never from the input.** Don't add a `userId` argument: the database already knows who is calling. If an action ever needs the user on the server, use `supabase.auth.getClaims()`, never `getSession()`.
-- **Keep the secret key in one place.** Only the password reset may use a secret key, through lib/supabase/admin.ts (`createAdminClient()` for the real project, `createDemoAdminClient()` for the demo's reset); never create a secret-key client anywhere else. It skips every database rule, so a mistake there lets any visitor do anything.
+- **Keep the secret key in one place.** Only the password reset (`app/actions/recovery.ts`) and push alerts (`app/actions/push.ts`, which `app/api/push/renew/route.ts` calls) may use a secret key, through lib/supabase/admin.ts (`createAdminClient()` for the real project, `createDemoAdminClient()` for the demo's reset); never create a secret-key client anywhere else, and never use the cookie client for push. It skips every database rule, so a mistake there lets any visitor do anything.
 - **Return only what the screen needs**, and pass on only ICEPik's own error messages (`P0001`). Everything else becomes "Something went wrong."
 - **Keep Next.js's defaults.** Don't add `serverActions.allowedOrigins` or raise `bodySizeLimit` without checking with the backend owner.
 - **Keep server code out of the browser.** `lib/supabase/server.ts` starts with `import 'server-only'`, so the build fails if a client component imports it.
@@ -749,6 +761,251 @@ Server actions are public endpoints: anyone can call one directly with any input
 - In Settings, add "Make a new recovery key" for when someone thinks theirs was seen. It asks for the password and signs in with it first, because the database makes a key only within 10 minutes of a password sign-in. Ask for the current password when changing the password too.
 - After a saved account logs in, call has\_recovery\_key(). If it returns false (an interrupted save, or an account from before recovery keys), ask once to make one.
 
+## Push alerts
+
+Phones can ask for a push alert when a new sighting appears near a saved place (Home, Work and custom places, at most 5 switched on) or, if the person opts in, near where they last opened ICEPik. One alert distance covers all places: 1, 2 or 5 miles (1 by default). The server side is built; the phone's side comes in later handoffs.
+
+Every push is shown, with its real distance from the nearest watched place, because browsers require a visible notification for each push: Safari revokes a site's push permission when pushes arrive without one, and Chrome shows its own notice instead. iPhones support neither quiet notifications nor replacing one notification with another. So the phone can't drop a pin that's farther than the chosen distance: the squares (below) decide who gets an alert. With ~2.2 km squares, 0.25, 0.5 and 1 mile list exactly the same squares for every place south of 55°N, which covers the contiguous US, Hawaii and the territories; they differ only in Alaska north of 55°N. So the choices are 1, 2 and 5 miles. An alert can come from farther than the chosen distance, up to about 4 miles away at 1 mile:
+
+| Alert distance | Squares per place at 25°N / 40°N / 49°N | Farthest alert at 25°N / 40°N / 49°N |
+| --- | --- | --- |
+| 1 mile (default) | 9 / 9 / 9 | 4.3 / 3.9 / 3.6 miles |
+| 2 miles | 21 / 25 / 25 | 5.6 / 5.9 / 5.5 miles |
+| 5 miles | 65 / 77 / 87 | 8.6 / 8.8 / 8.4 miles |
+
+The farthest alert is for a place in one corner of its square and a sighting in the far corner of the farthest square listed. The setting's wording will tell people that some alerts may be a little farther away. The server, the squares and the privacy model don't change.
+
+### What the server stores
+
+`public.push_subscriptions`, one row per phone:
+
+| Column | What it is |
+| --- | --- |
+| `id` | Random UUID. The phone keeps it |
+| `endpoint`, `p256dh`, `auth` | The browser's push subscription. The endpoint must be `https://` on Chrome's (`fcm.googleapis.com` or `jmt17.google.com`), Apple's (`web.push.apple.com`), Mozilla's (`updates.push.services.mozilla.com`) or Microsoft's (`*.notify.windows.com`) push service, at most 1,024 characters, so the sender can never be aimed at another URL |
+| `cells` | 1 to 1,000 square ids, sorted, without repeats |
+| `secret_hash` | SHA-256 of a random 32-byte device secret that only the phone holds |
+| `created_on`, `expires_on` | Dates, never times. A row expires 30 days after the app was last opened |
+
+There is no user id. RLS is on with no policies, the browser roles have no grants, and every push function can be called only with the secret key, so nobody can skip the server's checks with the public key. The server actions use `createAdminClient()`, which sends no user session, so Supabase's logs can't tie a subscription request to an account.
+
+`public.push_vapid_tokens`, one row per push service, holds the sender's signed VAPID token for it, shared by every run of the sender (see "The sender" below):
+
+| Column | What it is |
+| --- | --- |
+| `origin` | The push service's `https://` origin, such as `https://web.push.apple.com`, with no path and no port. Same list of push services as `endpoint` above. The primary key |
+| `public_key` | The VAPID public key the token was signed with (87 characters) |
+| `subject` | The contact (`VAPID_SUBJECT`) the token names, at most 512 characters |
+| `header` | The whole `Authorization` value, `vapid t=<token>, k=<public key>`, at most 2,048 characters. Its `k=` must be `public_key` |
+| `expires_at` | When the token expires (its `exp`) |
+
+RLS is on with no policies and the browser roles have no grants, so only the secret key reaches it, through `push_vapid_get` and `push_vapid_put`. It never holds the private key. Keeping a token here is acceptable: it expires within 12 hours (the sender signs it for 12, and `push_vapid_put` refuses an expiry more than 24 hours ahead), and it is useless without push endpoints, which only the secret key can read.
+
+### The squares
+
+A square ("cell") is a fixed grid square 0.020° of latitude by 0.026° of longitude, about 2.2 km × 2.2 km at 40°N. Its id is `row * 20000 + col`, worked out in whole thousandths of a degree so the phone (`cellOf()` in `lib/push-cells.ts`) and Postgres (`public.push_cell()`) always agree, even for a pin exactly on an edge (pins are rounded to 0.001°). For each place, the phone sends every square within the alert distance of **the square that holds the place** (`cellsAround()`). That list depends only on which square the place is in, never on where in the square it sits, so the server can't place anyone more precisely than one square, at any alert distance. Five places and the last-opened spot at 5 miles stay under 1,000 squares anywhere in the US (906 at Utqiaġvik, Alaska). Every push is shown, with its real distance from the nearest watched place, because browsers require a visible notification for each push. The phone works out that distance and writes the alert text itself, so the alert's wording never reaches the server.
+
+What the squares don't protect: the server still knows which ~2.2 km squares a phone watches, and a square around someone's home narrows down where they live. Each push service (Google, Apple, Mozilla or Microsoft) sees when a phone gets an alert, though not what it says, and those times can be matched with the public sightings' `created_at` to guess which squares a phone watches. Push service and Supabase logs can be demanded like any other records.
+
+### Functions and the cleanup job
+
+See the table under "Server functions" above. In short: `push_create`, `push_update` and `push_delete` for the server actions; `push_targets` and `push_drop` for the sender, and `push_vapid_get` and `push_vapid_put` for its shared token; `push_cell` and `push_purge` for the database itself. Errors: `push_endpoint_taken` (that endpoint is already saved), `push_invalid` (bad secret or cells, an endpoint without its keys, or a token expiry that is missing, past or more than 24 hours ahead), and the tables' checks.
+
+`pg_cron` runs `purge-push-subscriptions` every day at 04:17 UTC: `select public.push_purge()` deletes subscriptions whose `expires_on` has passed and tokens whose `expires_at` has passed.
+
+### In the app
+
+- `lib/push-cells.ts`: the grid maths and the distance choices (`ALERT_DISTANCES_MI`, 1, 2 and 5 miles, and `DEFAULT_ALERT_DISTANCE_MI`, 1), with no imports, shared by the pages and the service worker. Must match `push_cell()`.
+- `lib/turnstile.ts`: checks a Turnstile token with Cloudflare's siteverify, using `TURNSTILE_SECRET_KEY`, the action `alerts`, and a 5-second limit. It never sends the visitor's IP address. Without the secret, every Vercel deployment (previews too, as they use the real database) refuses with `not_configured`; only a local run with no `VERCEL_ENV` skips the check, for the checks against `scripts/mock-supabase.mjs`.
+- `app/actions/push.ts`: `createPushSubscription` (needs a Turnstile token), `updatePushSubscription` and `deletePushSubscription` (need the device secret). Each returns `{ ok: true, data }` or `{ ok: false, error, message }`, where `error` is `invalid`, `captcha`, `endpoint_taken`, `not_found`, `not_configured` or `failed`.
+- `app/api/push/renew/route.ts`: `POST` only, JSON body `{ id, secret, endpoint, p256dh, auth }`, for the service worker to swap in a new endpoint. Empty answers with `Cache-Control: no-store`: 204 done, 400 bad input (or the endpoint is taken), 403 cross-site (`Sec-Fetch-Site` other than `same-origin`) or wrong id or secret, 503 not set up or the database failed.
+
+What the phone side does (built in handoff 4; `scripts/alerts-flows.mjs` checks each point against `scripts/mock-supabase.mjs`):
+
+- **Where it lives.** `public/sw.js` (the service worker: `push`, `notificationclick` and `pushsubscriptionchange`, no `fetch` handler and no cache; served by `next.config.ts` with its own CSP, and skipped by `proxy.ts`); `lib/alerts/client.ts` (the API the screens use: `alertSupport`, `prepareAlerts`, `releaseAlerts`, `enableAlerts`, `disableAlerts`, `updateAlertSettings`, `useAlertSettings`); `lib/alerts/idb.ts` (the `icepik-alerts` IndexedDB copy the worker reads); `lib/alerts/upkeep.ts` (refresh on open, pending open, the in-app notice); `lib/alerts/strings.ts` (every text); `app/_components/alerts-settings.tsx` (Settings → Alerts, on `/` only); the alerts section of `policy.tsx`. The settings live in `localStorage` under `icepik.alerts` (no id, secret or endpoint there; those are in IndexedDB).
+- **Nothing exists before it's asked for.** No service worker and no IndexedDB database until the person opens Settings → Alerts (after consent, on `/`); leaving that screen with alerts off removes them again. `/demo` has no Alerts entry and registers nothing; its Clear this device still runs the teardown.
+
+- **Show a notification for every push.** In the service worker's `push` handler, show one inside `event.waitUntil()`, even for a pin farther away than the chosen distance: a push with no notification makes Safari revoke the site's push permission, and Chrome shows its own notice instead. Say how far the sighting is from the nearest watched place, and which place that is.
+- **Use the sighting id as the notification's tag.** The message's `id` goes in `tag`, so a repeat of the same sighting replaces the first where the browser supports it. iPhones may not: same-tag notifications don't replace each other on iOS (WebKit bug 258922), which is why the sender never repeats a follow-on call that may have run (see "No second chances" below).
+- **Subscribe inside the tap handler itself.** Call `pushManager.subscribe()` directly in the handler of the tap that turns alerts on, before anything that waits, as Apple asks. Then run the Turnstile check and `createPushSubscription`.
+- **Keep the server in step.** The phone can't hide a push, so every way of stopping or narrowing alerts has to reach the server. Turning alerts off and "Clear this device" call `deletePushSubscription` with the stored id and device secret before clearing them, then `PushSubscription.unsubscribe()`, even if the delete failed (the push service then answers 404 or 410, and the sender drops the row). Clear also deletes the service worker's own copy of the places. Otherwise the next person on a shared phone sees alerts for the last person's squares, and turning alerts on again fails with `endpoint_taken`, because the browser keeps its old subscription. Every other change to what is watched calls `updatePushSubscription` with the new squares: adding, moving or removing a place, switching one on or off, changing the distance, turning the last-opened option on or off, and a new last-opened spot. With nothing left to watch, turn alerts off as above. A change is done only when `updatePushSubscription` answers `{ ok: true }`; until then the server keeps sending for the old squares. If the call fails (no network, `failed` or `not_configured`), keep the change pending and send it again, with the current squares, when the app next opens or the network is back. `not_found` means the server has no row and sends nothing, so show its message. The renewal each time the app opens sends the current squares too, because an update without `cells` keeps the old ones.
+- **Offer the distance choices.** The setting offers `ALERT_DISTANCES_MI`, with `DEFAULT_ALERT_DISTANCE_MI` chosen at first, and its wording says that some alerts may be a little farther away.
+- **Show the warning first.** Turning alerts on needs the warning's box ticked, a place switched on and a Turnstile token (action `alerts`; none when the check is off locally). The tap calls `enableAlerts()` with no `await` before it, so `subscribe()` is the first thing that waits. The last-opened option has its own warning with Turn on and Cancel. The notification text is private by default; the "Show place and distance in alerts" switch turns the detailed text on.
+- **Refresh on open** (and when the page becomes visible again, at most hourly): register the worker again, drop alerts if permission or the browser's subscription is gone (`blocked`), send a changed endpoint, send the current squares plus any change still `pending` (this renews the 30 days), and drop alerts on `not_found` (`expired`). Changes to places that leave nothing to watch turn alerts off (`no-places`) with a notice. A tap on a notification opens `/` (never `/demo`) and the app reads `pendingOpen` from IndexedDB to show the sighting.
+
+### Owner steps for push
+
+Do these on your own computer and in the dashboards. The real project only: `/demo` has no push alerts, so never run the push migration on the demo project.
+
+1. **VAPID keys.** On your own computer, make a key pair with Node 20 or later (the app already needs it); nothing is added to the repository. Save this as `vapid-keys.mjs` in a folder outside the repository (your Desktop, say) and run `node vapid-keys.mjs` there:
+
+   ```js
+   // vapid-keys.mjs: makes a VAPID key pair (ES256, P-256) with Node's built-in WebCrypto.
+   const { publicKey, privateKey } = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
+   const jwk = await crypto.subtle.exportKey("jwk", privateKey);
+   const point = new Uint8Array(await crypto.subtle.exportKey("raw", publicKey));
+   console.log("Public key (NEXT_PUBLIC_VAPID_PUBLIC_KEY, for Vercel):");
+   console.log(Buffer.from(point).toString("base64url"));
+   console.log("\nPrivate key (VAPID_PRIVATE_JWK, for Supabase):");
+   console.log(JSON.stringify({ alg: "ES256", ...jwk }));
+   ```
+
+   It prints a public key (87 characters, for the app) and a private key as one line of JWK JSON (for the sender). Keep the private key out of Vercel, the repository and chats; step 2 of "The sender" below says where it goes. Make the pair once: a new pair makes every saved subscription useless (see "What to know" below).
+2. **Vercel.** In the project, open Settings → Environment Variables, and add for the **Production** environment:
+   - `NEXT_PUBLIC_VAPID_PUBLIC_KEY`: the public key from step 1, type **Config** (it's built into the page, so it isn't secret).
+   - `TURNSTILE_SECRET_KEY`: the secret key of the same Turnstile widget that Supabase Auth's CAPTCHA uses (Cloudflare dashboard → Turnstile → the widget → its secret key), type **Secret** (write-only after saving; Vercel used to call these "Sensitive"). Never give it a `NEXT_PUBLIC_` name.
+   Then redeploy: changes apply only to new deployments.
+3. **Supabase, real project only.** SQL Editor → New query → paste `database/migrations/20261125_push_subscriptions.sql` → Run. The last statement should show `129944032`. Check again any time with `select public.push_cell(39.952, -75.164);` (expect `129944032`), and see the job with `select jobname, schedule from cron.job where jobname = 'purge-push-subscriptions';`.
+4. **Check after the migration.** The migration was tried only in a stand-in Postgres (a test copy of Supabase's roles, with `pg_cron` replaced), so confirm the real project before going on. SQL Editor → New query → paste this → Run. It only reads:
+
+   ```sql
+   select n, "check", result, should_be, result = should_be as ok
+   from (
+     select 1 as n, 'RLS is on for push_subscriptions' as "check",
+            (select relrowsecurity::text from pg_class where oid = 'public.push_subscriptions'::regclass) as result,
+            'true' as should_be
+     union all
+     select 2, 'row policies on push_subscriptions',
+            (select count(*)::text from pg_policies where schemaname = 'public' and tablename = 'push_subscriptions'),
+            '0'
+     union all
+     select 3, 'anon has a table privilege on push_subscriptions',
+            has_table_privilege('anon', 'public.push_subscriptions', 'select,insert,update,delete,truncate,references,trigger')::text,
+            'false'
+     union all
+     select 4, 'authenticated has a table privilege on push_subscriptions',
+            has_table_privilege('authenticated', 'public.push_subscriptions', 'select,insert,update,delete,truncate,references,trigger')::text,
+            'false'
+     union all
+     select 5, 'anon or authenticated has a column privilege on push_subscriptions',
+            (has_any_column_privilege('anon', 'public.push_subscriptions', 'select,insert,update,references')
+             or has_any_column_privilege('authenticated', 'public.push_subscriptions', 'select,insert,update,references'))::text,
+            'false'
+     union all
+     select 6, 'push functions in public',
+            (select count(*)::text from pg_proc p join pg_namespace s on s.oid = p.pronamespace
+              where s.nspname = 'public' and p.proname like 'push\_%'),
+            '10'
+     union all
+     select 7, 'push functions anon can execute',
+            (select count(*)::text from pg_proc p join pg_namespace s on s.oid = p.pronamespace
+              where s.nspname = 'public' and p.proname like 'push\_%' and has_function_privilege('anon', p.oid, 'execute')),
+            '0'
+     union all
+     select 8, 'push functions authenticated can execute',
+            (select count(*)::text from pg_proc p join pg_namespace s on s.oid = p.pronamespace
+              where s.nspname = 'public' and p.proname like 'push\_%' and has_function_privilege('authenticated', p.oid, 'execute')),
+            '0'
+     union all
+     select 9, 'of push_create, push_update, push_delete, push_targets, push_drop, push_vapid_get and push_vapid_put, how many service_role can execute',
+            (select count(*)::text from pg_proc p join pg_namespace s on s.oid = p.pronamespace
+              where s.nspname = 'public'
+                and p.proname in ('push_create', 'push_update', 'push_delete', 'push_targets', 'push_drop', 'push_vapid_get', 'push_vapid_put')
+                and has_function_privilege('service_role', p.oid, 'execute')),
+            '7'
+     union all
+     select 10, 'cron job purge-push-subscriptions',
+            (select coalesce(string_agg(schedule || case when active then ' (active)' else ' (not active)' end, ', '), 'missing')
+               from cron.job where jobname = 'purge-push-subscriptions'),
+            '17 4 * * * (active)'
+     union all
+     select 11, 'push_cell(39.952, -75.164)', public.push_cell(39.952, -75.164)::text, '129944032'
+     union all
+     select 12, 'RLS is on for push_vapid_tokens',
+            (select relrowsecurity::text from pg_class where oid = 'public.push_vapid_tokens'::regclass),
+            'true'
+     union all
+     select 13, 'row policies on push_vapid_tokens',
+            (select count(*)::text from pg_policies where schemaname = 'public' and tablename = 'push_vapid_tokens'),
+            '0'
+     union all
+     select 14, 'anon has a table privilege on push_vapid_tokens',
+            has_table_privilege('anon', 'public.push_vapid_tokens', 'select,insert,update,delete,truncate,references,trigger')::text,
+            'false'
+     union all
+     select 15, 'authenticated has a table privilege on push_vapid_tokens',
+            has_table_privilege('authenticated', 'public.push_vapid_tokens', 'select,insert,update,delete,truncate,references,trigger')::text,
+            'false'
+     union all
+     select 16, 'anon or authenticated has a column privilege on push_vapid_tokens',
+            (has_any_column_privilege('anon', 'public.push_vapid_tokens', 'select,insert,update,references')
+             or has_any_column_privilege('authenticated', 'public.push_vapid_tokens', 'select,insert,update,references'))::text,
+            'false'
+   ) as checks
+   order by n;
+   ```
+
+   It returns 16 rows, and the `ok` column of every row should be `true`. If any row says `false`, stop: don't deploy the sender or turn on alerts until it is fixed (ask the backend owner, or re-run the migration, which is safe to run twice). What each row should show:
+
+   | Row | Should be | What it proves |
+   | --- | --- | --- |
+   | 1 | `true` | Row-level security is on for `push_subscriptions` |
+   | 2 | `0` | There are no row policies, so with RLS on the browser roles can read or write no row |
+   | 3, 4 | `false` | `anon` and `authenticated` have no privilege on the table (no select, insert, update, delete, truncate, references or trigger) |
+   | 5 | `false` | ...and none on any single column of it |
+   | 6 | `10` | The push functions are all there: `push_cell`, `push_clean_cells`, `push_create`, `push_update`, `push_delete`, `push_targets`, `push_drop`, `push_vapid_get`, `push_vapid_put` and `push_purge` (a later handoff that adds one makes this number go up: expected then) |
+   | 7, 8 | `0` | Neither `anon` nor `authenticated` can run any push function |
+   | 9 | `7` | `service_role`, which the secret key uses, can run the seven it needs: `push_create`, `push_update`, `push_delete`, `push_targets`, `push_drop`, `push_vapid_get` and `push_vapid_put` |
+   | 10 | `17 4 * * * (active)` | The daily cleanup job exists, runs at 04:17 UTC and is on (`missing` or `(not active)` means it didn't get scheduled: see step 3) |
+   | 11 | `129944032` | The square for (39.952, −75.164) is the one `lib/push-cells.ts` gives |
+   | 12 | `true` | Row-level security is on for `push_vapid_tokens` |
+   | 13 | `0` | There are no row policies on it, so with RLS on the browser roles can read or write no token |
+   | 14, 15 | `false` | `anon` and `authenticated` have no privilege on `push_vapid_tokens` (no select, insert, update, delete, truncate, references or trigger) |
+   | 16 | `false` | ...and none on any single column of it |
+
+   `service_role` may also be able to run `push_cell`, `push_clean_cells` and `push_purge`, because Supabase gives it new functions by default. That is harmless (the secret key skips every rule anyway) and isn't checked.
+5. **Sender.** Deploy the `push-sightings` Edge Function and create its webhook: see "The sender" below.
+
+### The sender: the `push-sightings` Edge Function
+
+`supabase/functions/push-sightings/index.ts` sends the alerts, and `webpush.ts` beside it encrypts each message and signs the VAPID tokens with the runtime's built-in WebCrypto (no package is used). A database webhook calls the function after every new pin. It checks the secret header, answers `ok` at once, and then, in the background, asks `push_targets` for the first 200 subscriptions whose squares hold the pin's square. For each one it first checks the endpoint against the same list of push services as the table and `app/actions/push.ts` (a mismatch counts as failed and is never contacted), then encrypts the message for that subscription (`aes128gcm`, RFC 8291, one record padded as RFC 8188 describes to a fixed size, so every body is 1,126 octets whatever the text), adds the VAPID token for that push service (RFC 8292, ES256; see below) and sends it (TTL 1 hour, urgency high, no topic, 20 at a time). The function deletes the subscriptions whose push service answers 404 or 410 with `push_drop`. If the page was full, it calls itself for the next 200 (see "The follow-on call" below). A 429, a 5xx answer or a network error on a push is retried twice, after the `Retry-After` wait (at most 10 s) or else 2 s and then 6 s. No push request starts more than 100 s into a call, and a message that still fails is dropped, not kept. A push that would start after 100 s counts as failed at once, with no token read, signed or stored for it. If a push started just before 100 s, its token read may finish after it: the push isn't sent, but a token signed then is still stored for later calls. Everyone gets the same message: `{ "v": 1, "id", "lat", "lng", "cat", "at", "pad" }`, the pin's rounded point, category, time and id, padded with spaces to exactly 512 characters.
+
+**One token per push service, shared.** Apple asks senders not to refresh the token more than once an hour, but a function worker on the Free plan lives at most 150 s, so a token kept in a worker's memory would be signed again for nearly every pin. So the token for each push service's origin is kept in `push_vapid_tokens` and shared by every worker. In each call, the first push to an origin reads the stored token with `push_vapid_get`, with the secret key in `apikey` only, as for `push_targets`. Every other push to that origin in the call waits for the same answer, so a call reads at most once and signs at most once per origin. Only when no stored token is usable (none is stored, it has under 15 minutes left, or it was signed with another key or subject) does the call sign a new one for 12 hours, store it with `push_vapid_put` without waiting, and use it. The sender checks a stored token again before using it: its form, key, push service, subject and expiry (not its signature). The call ends only after its token writes have finished, but a write never delays a push. Two workers at the same moment may each sign one; the last write stays. If the read or the write fails (an error, a timeout, or an answer that isn't a usable token), the call signs its own token and sends anyway: an alert matters more than the hourly guidance. Nothing about the token is logged. Only the origin of an endpoint that passed the check above ever reaches the table.
+
+**The follow-on call.** The call for the next page is tried once more only when it never ran: after a 429 (waiting for its `Retry-After`, at most 10 s, or else 2 s), or when Supabase's runtime throws its rate-limit error for function-to-function calls (`Deno.errors.RateLimitError`; waiting the `retryAfterMs` it gives, at most 10 s, or else 2 s when it gives none). Any other failure is not retried, including a 5xx answer, another 4xx, a network error or a timeout: a call that had started would send its page a second time, and iPhones show a repeat as a second notification (WebKit bug 258922). No retry starts 100 s or more into the call.
+
+It writes one log line per call, `{"event":"push-sightings","sent":n,"dropped":n,"failed":n,"next":true|false}`, and two error lines: `{"event":"push-sightings","error":"not_configured"}` (a secret is missing or malformed) and `{"event":"push-sightings","error":"unexpected"}` (anything else went wrong; it holds no detail on purpose, because errors from `fetch` contain the push endpoint). It never logs or returns an endpoint, key, coordinate, pin id or anything a push service said, and its answer is always one word: `ok`, `ignored`, `unauthorized` or `error`.
+
+Do these on your own computer, in the real project only. The Supabase CLI runs with `npx supabase …` (version 3.x was checked; `npx supabase --help` and `npx supabase functions deploy --help` list the current flags).
+
+1. **Log in and link.** `npx supabase login`, then `npx supabase link --project-ref <project-ref>` (the ref is in the project's URL and under Project Settings). Linking creates a `supabase/.temp` folder: don't commit it.
+2. **Secrets.** Set these three as Edge Function secrets, in Dashboard → Edge Functions → Secrets (best for the key: it stays out of your shell history), or with `npx supabase secrets set NAME=value`:
+
+   | Secret | Value |
+   | --- | --- |
+   | `VAPID_PRIVATE_JWK` | The private key (JSON) from "VAPID keys" in step 1 above, pasted as one line. It must be the pair of `NEXT_PUBLIC_VAPID_PUBLIC_KEY`: a phone accepts alerts only from the key it subscribed with. Never put it in the repository or Vercel |
+   | `VAPID_SUBJECT` | A contact for the push services: `mailto:name@example.org` or `https://example.org`, with no spaces or angle brackets (Apple refuses other forms), in plain ASCII (percent-encode anything else) and at most 512 characters, so `push_vapid_tokens` can store it. Otherwise the function answers `error` and logs `not_configured`. Google, Apple, Mozilla and Microsoft can see it, so use an address that isn't personal |
+   | `PUSH_WEBHOOK_SECRET` | A long random value, for example from `openssl rand -base64 32`. Keep it: the webhook needs the same value |
+
+   You don't set the project URL or the secret key: Supabase gives every function `SUPABASE_URL` and `SUPABASE_SECRET_KEYS` (a JSON list of the project's secret API keys; the function uses the one named `default`). If the function logs `not_configured`, check these three secrets first, then that the project has a secret API key. A private key whose `x` and `y` don't belong to its `d` is refused, and every push then counts as failed. A new value applies at once, with no redeploy. To use `--env-file` instead, keep the file outside the repository and delete it afterwards.
+3. **Deploy, with JWT verification off.** From the repository root: `npx supabase functions deploy push-sightings --no-verify-jwt --use-api` (`--use-api` bundles on Supabase's side, so Docker isn't needed). Supabase otherwise refuses calls that carry no Supabase login token, and the webhook sends none: the secret header is this function's check. Pass `--no-verify-jwt` on every deploy; a deploy without it turns verification back on. The function should then appear in Dashboard → Edge Functions.
+4. **Test call.** This sends a made-up pin straight to the function and inserts nothing into `sightings`, but it does send real pushes to every phone watching that square, so use a point near a test place that only your own test phone has switched on. The test phone shows every push it gets:
+
+   ```bash
+   read -rs PUSH_WEBHOOK_SECRET   # paste the secret; it won't show or enter your history
+   curl -i -X POST "https://<project-ref>.supabase.co/functions/v1/push-sightings" \
+     -H "content-type: application/json" \
+     -H "x-icepik-webhook: $PUSH_WEBHOOK_SECRET" \
+     -d '{"type":"INSERT","table":"sightings","record":{"id":"00000000-0000-4000-8000-000000000001","lat":39.952,"lng":-75.164,"category":"other","created_at":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"}}'
+   ```
+
+   Expect `200` and the body `ok`, an alert on the test phone within seconds, and in Dashboard → Edge Functions → push-sightings → Logs one line such as `{"event":"push-sightings","sent":1,"dropped":0,"failed":0,"next":false}`. With a wrong or missing `x-icepik-webhook` header the answer is `401` and `unauthorized`, and nothing is sent. A made-up pin that is valid but matches no phone logs `"sent":0`. Try an iPhone with the app on the Home Screen first: the encryption and the signing follow RFC 8291 and RFC 8292 and reproduce the RFC's own worked example, but they haven't met a real push service yet.
+5. **Create the webhook, real project only** (never the demo or a scratch project: it would send pushes for their pins too). Dashboard → Database → Webhooks → Create a new hook:
+   - Name `push_sightings`; Table `public.sightings`; Events: **Insert** only.
+   - Type of webhook: **Supabase Edge Functions** and pick `push-sightings` (or **HTTP Request** with method `POST` and the URL `https://<project-ref>.supabase.co/functions/v1/push-sightings`).
+   - HTTP Headers: keep `Content-Type: application/json` and add `x-icepik-webhook` with the same value as `PUSH_WEBHOOK_SECRET`. Don't add the "auth header with service key" option: the function doesn't need it, and it would send the secret key to it. The webhook stores the header value in its trigger, visible to anyone with database access.
+   - Timeout: the default is 1000 ms. Raise it to 5000 ms: the function answers at once, but a cold start can take longer than a second, and a webhook that times out is not retried.
+
+   Then post a pin from a second phone, or run the "Test pins" SQL above (delete it afterwards), and check the function's Logs. `pg_net` keeps each answer for 6 hours in `net._http_response`; the function's are one word.
+
+What to know:
+
+- **Free plan.** A call may use 2 s of CPU and 150 s of wall time ([limits](https://supabase.com/docs/guides/functions/limits)), and the plan gives 500,000 calls a month. In the local test one message cost about 1.5 to 1.6 ms of CPU (encrypting it, with the token already signed, 1.0 to 1.1 ms), so a 200-subscriber page takes roughly 0.3 s. A call signs at most one token per push service. A pin costs one call plus one more for every further 200 subscribers.
+- **Long chains.** Supabase's limits page lists "Recursive/Nested Function Calling: 30 requests per trace, within a 60-second window" ([limits](https://supabase.com/docs/guides/functions/limits), [recursive calls](https://supabase.com/docs/guides/functions/recursive-functions)). If that applies to the function calling itself, alerts for one pin would stop after about 6,000 subscribers. Watch this if the number of subscriptions grows. Over that limit, Supabase's runtime throws its rate-limit error, and the follow-on call is tried once more after the wait the error gives (at most 10 s, or 2 s when it gives none); that retry may count toward the same 30.
+- **No second chances.** A follow-on call is tried once more only after a 429 or Supabase's rate-limit error, which both mean it never ran. After any other failure, or if that one retry fails too, the rest of that pin's subscribers may get no alert: a call that may have run is never repeated, because the phones on its page would get the alert twice. A push that still fails after its retries is dropped.
+- **Rotating the VAPID key** makes every saved subscription useless, since phones accept only the key they subscribed with: they have to subscribe again. Stored tokens of the old key are ignored (`push_vapid_get` matches the public key) and replaced on first use. A new `VAPID_SUBJECT` works the same way.
+- **A bad stored token.** The sender doesn't check a stored token's signature. Only the secret key or the database's owner can write one, but if a token that looks right yet fails at a push service got in, pushes to that service would fail until it has under 15 minutes left (at most 24 hours). To clear the tokens, run `delete from public.push_vapid_tokens;` in the SQL Editor: the next call signs new ones.
+
 ## Done when
 
 Run these on two real phones (A and B) against the Supabase project before calling the frontend done.
@@ -776,7 +1033,8 @@ Run these on two real phones (A and B) against the Supabase project before calli
 
 These are outside the MVP schema. Ask before building screens that need them.
 
-- **Stretch features with no tables yet:** notifications, local news, live streaming and translated text. Only `preferred_language` is stored. Light mode needs nothing from the database.
+- **Push alerts: built, not yet tried on real phones.** The tables, functions, cleanup job, server actions, renew route and sender (see "Push alerts" above), and the phone side ("In the app": service worker, Settings → Alerts, subscribe flow, upkeep, policy text) are built and checked against stand-ins. The owner approved the policy wording and the in-app warning text on 28 November 2026, and `POLICY_VERSION` is `2026-11-28`, no longer marked draft. Still to do: the owner's device check on a preview deployment (iPhone Home Screen app and Android).
+- **Stretch features with no tables yet:** local news, live streaming and translated text. Only `preferred_language` is stored. Light mode needs nothing from the database.
 - **Out of scope in the PRD:** comments and followers.
 - **No moderation:** there's no "report this pin" flow. For now, admins delete harmful posts in Supabase's Table Editor. A report button needs a new table, so ask first.
 - **Run the live checks before upgrading the live project.** The database was tested on a local copy, not on Supabase itself. `scripts/supabase-live-checks.mjs` runs against a scratch Supabase project set up like production (its header lists the settings) and checks what this design depends on: CAPTCHA and "Require current password" really on, anonymous sign-in with the new trigger on `auth.users`, saving an anonymous account, the `amr` claim after a sign-in and after a refresh, that a reset ends every session and that the old tokens of those sessions can't make a key or delete the account, that Supabase's own "forgot password" is refused by the hook and stores no code, and the delete rules. Supabase Auth's source already shows two of these: the current-password check applies only to users who already have a password (`internal/api/user.go`), and an admin password change logs out every session (`internal/api/admin.go` calls `UpdatePassword` with no session, which runs `Logout`). The hourly cleanup job also hasn't run on Supabase yet.
@@ -815,3 +1073,15 @@ These are outside the MVP schema. Ask before building screens that need them.
 - [supabase/auth: user update and the current-password check (internal/api/user.go)](https://github.com/supabase/auth/blob/master/internal/api/user.go)
 - [supabase/auth: admin user update (internal/api/admin.go)](https://github.com/supabase/auth/blob/master/internal/api/admin.go)
 - [Cloudflare Turnstile: test keys](https://developers.cloudflare.com/turnstile/troubleshooting/testing/)
+- [Cloudflare Turnstile: server-side validation (siteverify)](https://developers.cloudflare.com/turnstile/get-started/server-side-validation/)
+- [Supabase: Cron quickstart (cron.schedule)](https://supabase.com/docs/guides/cron/quickstart)
+- [Vercel: Config and Secret environment variables](https://vercel.com/docs/environment-variables/sensitive-environment-variables)
+- [Vercel: Managing environment variables](https://vercel.com/docs/environment-variables/managing-environment-variables)
+- [RFC 8188: Encrypted Content-Encoding for HTTP](https://www.rfc-editor.org/rfc/rfc8188)
+- [RFC 8291: Message Encryption for Web Push (its section 5 is the worked example)](https://www.rfc-editor.org/rfc/rfc8291)
+- [RFC 8292: VAPID for Web Push](https://www.rfc-editor.org/rfc/rfc8292)
+- [Supabase: Recursive / nested function calls](https://supabase.com/docs/guides/functions/recursive-functions)
+- [Supabase: Edge Function limits (150 s wall clock on the Free plan, 2 s of CPU)](https://supabase.com/docs/guides/functions/limits)
+- [Apple: Sending web push notifications in web apps and browsers (no invisible pushes, no JWT refresh more than once an hour, subscribe from the gesture's handler)](https://developer.apple.com/documentation/usernotifications/sending-web-push-notifications-in-web-apps-and-browsers)
+- [WebKit bug 258922: push notifications with the same tag don't replace each other](https://bugs.webkit.org/show_bug.cgi?id=258922)
+- [Pushpad: what are the browser push services?](https://pushpad.xyz/blog/what-are-the-browser-push-services)

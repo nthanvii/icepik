@@ -194,6 +194,35 @@ export type Database = {
       };
       has_recovery_key: { Args: Record<PropertyKey, never>; Returns: boolean };
       purge_expired_links: { Args: Record<PropertyKey, never>; Returns: undefined };
+      push_cell: { Args: { p_lat: number; p_lng: number }; Returns: number };
+      push_clean_cells: { Args: { p_cells: number[] }; Returns: number[] };
+      push_create: {
+        Args: { p_auth: string; p_cells: number[]; p_endpoint: string; p_p256dh: string; p_secret: string };
+        Returns: string;
+      };
+      push_delete: { Args: { p_id: string; p_secret: string }; Returns: boolean };
+      push_drop: { Args: { p_ids: string[] }; Returns: undefined };
+      push_purge: { Args: Record<PropertyKey, never>; Returns: undefined };
+      push_targets: {
+        Args: { p_after: string | null; p_lat: number; p_limit: number; p_lng: number };
+        Returns: { auth: string; endpoint: string; id: string; p256dh: string }[];
+      };
+      push_update: {
+        Args: {
+          p_auth?: string;
+          p_cells?: number[];
+          p_endpoint?: string;
+          p_id: string;
+          p_p256dh?: string;
+          p_secret: string;
+        };
+        Returns: boolean;
+      };
+      push_vapid_get: { Args: { p_origin: string; p_public_key: string; p_subject: string }; Returns: string };
+      push_vapid_put: {
+        Args: { p_expires_at: string; p_header: string; p_origin: string; p_public_key: string; p_subject: string };
+        Returns: undefined;
+      };
       replace_recovery_key: { Args: { p_user_id: string }; Returns: string };
       set_my_language: { Args: { new_language: string }; Returns: undefined };
       signed_in_with_password_recently: { Args: Record<PropertyKey, never>; Returns: boolean };
