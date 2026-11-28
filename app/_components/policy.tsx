@@ -1,6 +1,6 @@
 // Change the version whenever the text below changes: everyone is asked to
 // agree again. The accepted version is kept in localStorage only.
-export const POLICY_VERSION = "2026-11-22-draft";
+export const POLICY_VERSION = "2026-11-28-draft";
 
 // Plain-language terms and privacy notice, shown before anything else loads.
 // DRAFT: the team must review this text before launch.
@@ -87,18 +87,66 @@ export function PolicyText() {
           <strong>We can’t promise complete anonymity.</strong> A subpoena or warrant can
           require these providers to hand over the logs they hold.
         </li>
+        <li>
+          <strong>Alerts are optional and off until you turn them on.</strong> Before you can, Settings
+          shows a warning about what they reveal and asks you to confirm you understand it. Without
+          alerts, none of what follows applies.
+        </li>
+        <li>
+          <strong>What our server keeps for alerts.</strong> A list of map squares, each about 2.2 km
+          (1.4 miles) across, around the places you choose (up to 5), and the address your phone&apos;s
+          push service (Apple, Google, Mozilla or Microsoft) gives us to reach it. It keeps no
+          account, username or exact place, and it can&apos;t tell where in a square a place is. Your
+          places stay on this device, but the list shows which square each one is in. Anyone who gets
+          it, for example through a data breach or a legal demand, could see which areas this phone
+          gets alerts for, and with the push company&apos;s records, whose phone it is. Cloudflare&apos;s
+          security check sees your IP address and browser when you open the Alerts screen to turn them on.
+        </li>
+        <li>
+          <strong>What push companies see.</strong> The push company knows which phone, and usually
+          which account, each alert goes to. It can&apos;t read the alerts, but it sees when they
+          arrive. Sightings on the map are public, so the times of your alerts can be matched with
+          them to show roughly which areas you get alerts for.
+        </li>
+        <li>
+          <strong>What a locked phone shows.</strong> Every alert appears on the lock screen. By
+          default it names the kind of sighting and says it is near one of your places, with no
+          place name and no distance. If you switch on &ldquo;Show place and distance in alerts&rdquo;,
+          anyone who sees your phone, even locked, can read your place&apos;s name and how far away
+          the sighting was. Anyone who sees your phone can also see that you use ICEPik and when
+          alerts arrived.
+        </li>
+        <li>
+          <strong>Alerts near where you last opened ICEPik</strong> is a separate choice with its own
+          warning. When it&apos;s on, each time you open ICEPik the squares around where you are
+          replace the last ones on the server, so over time the push company could learn roughly where
+          you tend to open the app. ICEPik doesn&apos;t ask for your location just for this: it uses it
+          only if you already allowed it.
+        </li>
+        <li>
+          <strong>Alerts can come from a little farther than you choose.</strong> The server picks
+          who gets an alert by square, so some alerts come from up to about 4 miles away when you
+          choose 1 mile (about 6 at 2 miles and 9 at 5). Your phone shows each alert it receives. The
+          in-app notice for sightings near you while ICEPik is open sends nothing anywhere.
+        </li>
+        <li>
+          <strong>How alerts end.</strong> Turning alerts off, &ldquo;Clear this device&rdquo; and
+          deleting your account each ask the server to delete the list, then remove it from your phone.
+          If your phone is offline, the server still deletes the list about 30 days after you last
+          opened ICEPik, and alerts stop by then. Opening ICEPik while alerts are on renews the 30 days.
+        </li>
         <li>No ads, analytics or tracking.</li>
         <li>
           <strong>What this device keeps.</strong> Your sign-in, your home, work and other saved
-          places, your answer about location, your choice for the moving background, and which
-          version of these terms you agreed to. Saved places and these choices are never sent to
+          places, your answer about location, your choice for the moving background, your alert
+          settings, and which version of these terms you agreed to. Saved places and these choices are never sent to
           us.
         </li>
         <li>
           You can delete your account in Settings; a saved account asks for its password first.
           Your sightings stay on the map until they expire, with no link to you.
-          &ldquo;Clear this device&rdquo; removes saved places and the background choice, and
-          signs this device out.
+          &ldquo;Clear this device&rdquo; turns alerts off, removes saved places and the background
+          choice, and signs this device out.
         </li>
       </ul>
     </div>

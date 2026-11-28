@@ -12,7 +12,8 @@ import {
   normalizeUsername,
   usernameOf,
 } from "@/lib/accounts";
-import { disableAlerts } from "@/lib/alerts/client";
+import { disableAlerts, useAlertSettings } from "@/lib/alerts/client";
+import { alertText } from "@/lib/alerts/strings";
 import {
   CUSTOM_PLACES_MAX,
   clearDeviceStorage,
@@ -40,6 +41,7 @@ import {
   useCaptcha,
   type ShownKey,
 } from "./account-recovery";
+import { AlertsSettings } from "./alerts-settings";
 import { BrandLogo } from "./brand-logo";
 import { DEMO_ABOUT, useDemo } from "./demo-context";
 import { Captcha, captchaEnabled } from "./captcha";
@@ -56,6 +58,7 @@ type View =
   | "delete"
   | "clear"
   | "policy"
+  | "alerts"
   | "forgot"
   | "key"
   | "newkey"
@@ -233,6 +236,9 @@ export function SettingsDialog(props: Props) {
       ) : null}
       {view === "key" && shownKey ? (
         <RecoveryKeyShown shown={shownKey} onDone={() => keyDone(shownKey)} />
+      ) : null}
+      {view === "alerts" ? (
+        <AlertsSettings places={props.places} customPlaces={props.customPlaces} onBack={back} />
       ) : null}
       {view === "delete" ? <DeleteAccount {...props} onBack={back} /> : null}
       {view === "clear" ? <ClearDevice {...props} onBack={back} /> : null}
@@ -465,6 +471,19 @@ function MainView({
         </p>
       </section>
 
+      {demo ? null : (
+        <section className="settings-section" aria-labelledby="alerts-title">
+          <h3 id="alerts-title">{alertText("screenTitle")}</h3>
+          <p className="detail-hint">{alertText("entryIntro")}</p>
+          <AlertsStatus />
+          <div className="button-row">
+            <button type="button" className="secondary-button" data-opens="alerts" onClick={() => onOpen("alerts")}>
+              {alertText("entryButton")}
+            </button>
+          </div>
+        </section>
+      )}
+
       <section className="settings-section" aria-labelledby="display-title">
         <h3 id="display-title">Display</h3>
         <label className="switch-row">
@@ -513,6 +532,12 @@ function MainView({
       </section>
     </>
   );
+}
+
+// On or off, read from this device's settings (no IndexedDB).
+function AlertsStatus() {
+  const { on } = useAlertSettings();
+  return <p className="detail-hint">{alertText(on ? "entryOn" : "entryOff")}</p>;
 }
 
 function SaveAccount({

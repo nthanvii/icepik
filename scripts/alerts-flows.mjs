@@ -19,8 +19,10 @@
 //   - no endpoint, key, secret or coordinate reaches a URL, a console, the
 //     server's output or this script's output.
 //
+//   - the Alerts screen: its warning, box and button, and what each state says;
+//
 //   node scripts/alerts-flows.mjs           starts the stand-ins and `next dev`
-//   Options: --only headers,fresh,enable,push,tap,sync,stop,teardown,realtime
+//   Options: --only headers,fresh,enable,push,tap,sync,stop,teardown,realtime,screen
 //            --port 3210  --keep-logs <dir>  (the app's output is kept there)
 //
 // It starts scripts/mock-supabase.mjs on ports 54321 (the real map) and
@@ -1120,6 +1122,133 @@ if (wants("realtime")) {
   seenNotices = (await notices(page)).filter((t) => t.startsWith("New sighting near you"));
   check("One beyond the distance shows nothing", seenNotices.length === 1);
   await context.close();
+}
+
+// --- 9b. The Alerts screen ----------------------------------------------------------
+
+if (wants("screen")) {
+  const context = await newContext({ position: HERE });
+  const page = await openPage(context, "/");
+  await savePlaces(page, { work: false });
+  await reload(page);
+  const openSettings = async () => {
+    const rail = await page.locator(".rail-settings").isVisible();
+    await page.click(rail ? ".rail-settings" : ".panel-settings");
+    await page.waitForSelector(".modal .settings");
+  };
+  const calls = () => page.evaluate(() => window.__alertLog.map((e) => e.name));
+  const status = () => page.locator(".settings [role=status]").last().textContent();
+  const focusedText = () => page.evaluate(() => document.activeElement?.textContent?.trim() ?? "");
+  const tap = async () => {
+    await page.evaluate(() => (window.__alertLog.length = 0));
+    await page.click(".settings .primary-button", { force: true });
+    await sleep(400);
+  };
+
+  await openSettings();
+  check("Settings on / has an Alerts entry", (await page.locator('[data-opens="alerts"]').count()) === 1);
+  check("...saying alerts are off", (await page.locator(".settings").textContent()).includes("Alerts are off."));
+  let seen = await footprint(page);
+  check("Settings opening doesn't register a worker or create the database", !seen.workers && !seen.database, JSON.stringify(seen));
+
+  await page.click('[data-opens="alerts"]');
+  await page.waitForSelector("#alerts-view-title");
+  check("Opening Alerts moves focus to its heading", (await focusedText()) === "Alerts", await focusedText());
+  await waitFor(async () => (await footprint(page)).workers === 1, 20000, "the worker to register");
+  seen = await footprint(page);
+  check("...and registers the worker, with no database yet", seen.workers === 1 && !seen.database, JSON.stringify(seen));
+
+  const radios = await page.$$eval('input[name="alert-distance"]', (els) => els.map((el) => [el.value, el.checked]));
+  check("The distance group offers 1, 2 and 5 mi, 1 chosen first", JSON.stringify(radios) === '[["1",true],["2",false],["5",false]]', JSON.stringify(radios));
+  check("...in a fieldset with a legend", (await page.locator("fieldset legend").first().textContent()) === "Alert distance");
+  check("...with the line about farther alerts", (await page.locator(".settings").textContent()).includes("a little farther away"));
+
+  const text = await page.locator(".settings").textContent();
+  check("An unset place says Not set and can't be switched on", text.includes("Not set") && (await page.locator("#alert-place-work").evaluate((el) => el.closest("label").querySelector("input").disabled)));
+  const order = await page.evaluate(() => {
+    const at = (el) => (el ? [...document.querySelectorAll("*")].indexOf(el) : -1);
+    const heading = document.querySelector("#alerts-warning-title");
+    const box = document.querySelector('.settings input[type="checkbox"]:not([role])');
+    const button = document.querySelector(".settings .primary-button");
+    return [at(heading), at(box), at(button)];
+  });
+  check("The warning comes before the checkbox and the button", order[0] > 0 && order[0] < order[1] && order[1] < order[2], JSON.stringify(order));
+  check("The warning is page content, not an alert region", (await page.locator(".settings [role=alert]").count()) === 0);
+  check("The box starts unticked", !(await page.locator('.settings input[type="checkbox"]:not([role])').isChecked()));
+
+  await tap();
+  let log = await calls();
+  check("No place and an unticked box: the tap calls neither subscribe nor the server", !log.includes("subscribe") && !log.includes("action"), log.join(","));
+  check("...and a polite live region says why", (await status()).length > 0, await status());
+
+  await page.locator("#alert-place-home").evaluate((el) => el.closest("label").querySelector("input").click());
+  await waitFor(async () => (await settings(page))?.placeIds?.includes("home"), 5000, "Home to switch on");
+  await tap();
+  log = await calls();
+  check("A place on but the box unticked: neither is called", !log.includes("subscribe") && !log.includes("action"), log.join(","));
+  check("...and the message asks for the box", (await status()).includes("Tick the box"), await status());
+
+  await page.locator("#alert-place-home").evaluate((el) => el.closest("label").querySelector("input").click());
+  await waitFor(async () => !(await settings(page))?.placeIds?.includes("home"), 5000, "Home to switch off");
+  await page.locator('.settings input[type="checkbox"]:not([role])').check();
+  await tap();
+  log = await calls();
+  check("The box ticked but no place on: neither is called", !log.includes("subscribe") && !log.includes("action"), log.join(","));
+  check("...and the message asks for a place", (await status()).includes("at least one place"), await status());
+
+  await page.locator("#alert-place-home").evaluate((el) => el.closest("label").querySelector("input").click());
+  await waitFor(async () => (await settings(page))?.placeIds?.includes("home"), 5000, "Home to switch on");
+  await sleep(1500);
+  await clearMockRows();
+  await page.evaluate(() => (window.__alertLog.length = 0));
+  await page.click(".settings .primary-button", { force: true });
+  await page.waitForSelector("#alerts-on-title", { timeout: 20000 });
+  await rememberDevice(page);
+  log = await page.evaluate(() => window.__alertLog);
+  const sub = log.findIndex((e) => e.name === "subscribe");
+  const act = log.findIndex((e) => e.name === "action");
+  check("The real button calls subscribe() before the server action (inside the click: shown with the test's own button in part 3)", sub > -1 && (act === -1 || sub < act), log.map((e) => e.name).join(","));
+  check("...the server now has one row", (await mockRows()).length === 1);
+  await waitFor(async () => (await focusedText()) === "Alerts are on", 3000, "focus").catch(() => {});
+  check("Alerts are on: focus moves to its heading", (await focusedText()) === "Alerts are on", await focusedText());
+  check("...with the 30-day line and Turn off alerts", (await page.locator(".settings").textContent()).includes("30 days") && (await page.getByRole("button", { name: "Turn off alerts" }).count()) === 1);
+
+  const lastBox = page.locator("#last-label").locator("xpath=ancestor::label//input");
+  await lastBox.click();
+  check("Turning on the last-opened option shows its warning first", (await page.locator("#last-title").count()) === 1 && (await settings(page)).lastLocation === false);
+  check("...with focus on its heading", (await focusedText()) === "Alerts near where you last opened ICEPik", await focusedText());
+  await page.getByRole("button", { name: "Cancel" }).click();
+  check("Cancel leaves it off and returns focus to the switch", (await settings(page)).lastLocation === false && (await page.evaluate(() => document.activeElement?.getAttribute("aria-labelledby"))) === "last-label");
+  await lastBox.click();
+  await page.getByRole("button", { name: "Turn on", exact: true }).click();
+  await waitFor(async () => (await settings(page)).lastLocation === true, 5000, "the last-opened option");
+  check("Turn on in that warning switches it on", true);
+  await lastBox.click();
+  await waitFor(async () => (await settings(page)).lastLocation === false, 5000, "the option to switch off");
+  check("Turning it off needs no confirmation", (await page.locator("#last-title").count()) === 0);
+
+  await page.getByRole("button", { name: "Turn off alerts" }).click();
+  await waitFor(async () => (await mockRows()).length === 0, 15000, "the server row to go");
+  check("Turn off alerts deletes the server row and shows the warning again", (await page.locator("#alerts-warning-title").count()) === 1);
+  check("...with the box unticked again", !(await page.locator('.settings input[type="checkbox"]:not([role])').isChecked()));
+
+  await page.getByRole("button", { name: "Back" }).click();
+  await sleep(500);
+  check("Back returns focus to the Alerts entry", (await page.evaluate(() => document.activeElement?.getAttribute("data-opens"))) === "alerts");
+  await waitFor(async () => (await footprint(page)).workers === 0, 10000, "the worker to go");
+  seen = await footprint(page);
+  check("Leaving with alerts off removes the worker and the database", !seen.workers && !seen.database && !seen.caches, JSON.stringify(seen));
+  await context.close();
+
+  const demoContext = await newContext();
+  const demo = await openPage(demoContext, "/demo");
+  const rail = await demo.locator(".rail-settings").isVisible();
+  await demo.click(rail ? ".rail-settings" : ".panel-settings");
+  await demo.waitForSelector(".modal .settings");
+  check("On /demo Settings has no Alerts entry", (await demo.locator('[data-opens="alerts"]').count()) === 0);
+  seen = await footprint(demo);
+  check("...and no worker or database", !seen.workers && !seen.database, JSON.stringify(seen));
+  await demoContext.close();
 }
 
 await browser.close();
